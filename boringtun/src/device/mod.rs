@@ -153,17 +153,49 @@ impl Connection {
         let udp4 = Arc::new(udp4);
         let udp6 = Arc::new(udp6);
 
+        let weak_dev = Arc::downgrade(&device);
+        let udp4_copy = udp4.clone();
+        let udp6_copy = udp6.clone();
         let outgoing = Task::spawn(
             "handle_outgoing",
-            Device::handle_outgoing(Arc::downgrade(&device), udp4.clone(), udp6.clone()),
+            async move {
+                let mut tasks = vec![];
+                for _ in 0..8 {
+                    tasks.push(Task::spawn(
+                        "task",
+                        Device::handle_outgoing(weak_dev.clone(), udp4_copy.clone(), udp6_copy.clone())
+                    ));
+                }
+                for mut t in tasks {
+                    if let Some(h) = t.handle.take() {
+                        _ = h.await;
+                    }
+                }
+            },
+            //Device::handle_outgoing(Arc::downgrade(&device), udp4.clone(), udp6.clone()),
         );
         let timers = Task::spawn(
             "handle_timers",
             Device::handle_timers(Arc::downgrade(&device), udp4.clone(), udp6.clone()),
         );
+        let weak_dev = Arc::downgrade(&device);
+        let udp4_copy = udp4.clone();
         let incoming_ipv4 = Task::spawn(
             "handle_incoming ipv4",
-            Device::handle_incoming(Arc::downgrade(&device), udp4.clone()),
+            async move {
+                let mut tasks = vec![];
+                for _ in 0..8 {
+                    tasks.push(Task::spawn(
+                        "task",
+                        Device::handle_incoming(weak_dev.clone(), udp4_copy.clone())
+                    ));
+                }
+                for mut t in tasks {
+                    if let Some(h) = t.handle.take() {
+                        _ = h.await;
+                    }
+                }
+            },
         );
         let incoming_ipv6 = Task::spawn(
             "handle_incoming ipv6",
