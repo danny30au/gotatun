@@ -153,7 +153,7 @@ impl Connection {
         let udp4 = Arc::new(udp4);
         let udp6 = Arc::new(udp6);
 
-        let weak_dev = Arc::downgrade(&device);
+        let dev_copy = device.clone();
         let udp4_copy = udp4.clone();
         let udp6_copy = udp6.clone();
         let outgoing = Task::spawn(
@@ -163,7 +163,7 @@ impl Connection {
                 for _ in 0..8 {
                     tasks.push(Task::spawn(
                         "task",
-                        Device::handle_outgoing(weak_dev.clone(), udp4_copy.clone(), udp6_copy.clone())
+                        Device::handle_outgoing(dev_copy.clone(), udp4_copy.clone(), udp6_copy.clone())
                     ));
                 }
                 for mut t in tasks {
@@ -176,9 +176,9 @@ impl Connection {
         );
         let timers = Task::spawn(
             "handle_timers",
-            Device::handle_timers(Arc::downgrade(&device), udp4.clone(), udp6.clone()),
+            Device::handle_timers(device.clone(), udp4.clone(), udp6.clone()),
         );
-        let weak_dev = Arc::downgrade(&device);
+        let dev_copy = device.clone();
         let udp4_copy = udp4.clone();
         let incoming_ipv4 = Task::spawn(
             "handle_incoming ipv4",
@@ -187,7 +187,7 @@ impl Connection {
                 for _ in 0..8 {
                     tasks.push(Task::spawn(
                         "task",
-                        Device::handle_incoming(weak_dev.clone(), udp4_copy.clone())
+                        Device::handle_incoming(dev_copy.clone(), udp4_copy.clone())
                     ));
                 }
                 for mut t in tasks {
@@ -199,7 +199,7 @@ impl Connection {
         );
         let incoming_ipv6 = Task::spawn(
             "handle_incoming ipv6",
-            Device::handle_incoming(Arc::downgrade(&device), udp6.clone()),
+            Device::handle_incoming(device, udp6.clone()),
         );
 
         Ok(Connection {
@@ -488,7 +488,7 @@ impl Device {
         self.peers_by_ip.clear();
     }
 
-    async fn handle_timers(device: Weak<RwLock<Self>>, udp4: Arc<UdpSocket>, udp6: Arc<UdpSocket>) {
+    async fn handle_timers(device: Arc<RwLock<Self>>, udp4: Arc<UdpSocket>, udp6: Arc<UdpSocket>) {
         // TODO: fix rate limiting
         /*
         self.queue.new_periodic_event(
@@ -508,9 +508,6 @@ impl Device {
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
 
-            let Some(device) = device.upgrade() else {
-                break;
-            };
             let device = device.read().await;
             // TODO: pass in peers instead?
             let peer_map = &device.peers;
@@ -540,11 +537,8 @@ impl Device {
     }
 
     /// Read from UDP socket, decapsulate, write to tunnel device
-    async fn handle_incoming(device: Weak<RwLock<Self>>, udp: Arc<UdpSocket>) -> Result<(), Error> {
-        let Some(device_arc) = device.upgrade() else {
-            return Ok(());
-        };
-        let device_lock = device_arc.read().await;
+    async fn handle_incoming(device: Arc<RwLock<Self>>, udp: Arc<UdpSocket>) -> Result<(), Error> {
+        let device_lock = device.read().await;
 
         // TODO: check every time. TODO: ordering
         // TODO: wrap MTU in arc, and clone it
@@ -559,7 +553,6 @@ impl Device {
         let rate_limiter = device_lock.rate_limiter.clone().unwrap();
 
         drop(device_lock);
-        drop(device_arc);
 
         loop {
             // Loop while we have packets on the anonymous connection
@@ -580,9 +573,6 @@ impl Device {
                     Err(_) => continue,
                 };
 
-            let Some(device) = device.upgrade() else {
-                break;
-            };
             let device_guard = &device.read().await;
             let peers = &device_guard.peers;
             let peers_by_idx = &device_guard.peers_by_idx;
@@ -636,14 +626,11 @@ impl Device {
 
     /// Read from tunnel device, encapsulate, and write to UDP socket for the corresponding peer
     async fn handle_outgoing(
-        device: Weak<RwLock<Self>>,
+        device: Arc<RwLock<Self>>,
         udp4: Arc<UdpSocket>,
         udp6: Arc<UdpSocket>,
     ) {
-        let Some(device_arc) = device.upgrade() else {
-            return;
-        };
-        let device_lock = device_arc.read().await;
+        let device_lock = device.read().await;
 
         // TODO: pass in peers and sockets instead of device?
 
@@ -655,7 +642,6 @@ impl Device {
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
         drop(device_lock);
-        drop(device_arc);
 
         loop {
             let n = match tun.recv(&mut src_buf[..mtu]).await {
@@ -672,9 +658,6 @@ impl Device {
                 None => continue,
             };
 
-            let Some(device) = device.upgrade() else {
-                break;
-            };
             let peers = &device.read().await.peers_by_ip;
             let mut peer = match peers.find(dst_addr) {
                 Some(peer) => peer.lock().await,
