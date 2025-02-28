@@ -17,6 +17,8 @@ tracing-appender = "0.2.1"
 log = "*"
 tokio = { version = "1.43.0", features = ["full"] }
 
+tun = { version = "0.7.11", features = ["async"] }
+
 [dependencies.boringtun]
 version = "0.6.0"
 path = "../boringtun"

@@ -152,9 +152,19 @@ async fn main() {
         //use_connected_socket: !matches.is_present("disable-connected-udp"),
         #[cfg(target_os = "linux")]
         use_multi_queue: !matches.is_present("disable-multi-queue"),
+        on_bind: None,
     };
 
-    let _device_handle: DeviceHandle = match DeviceHandle::new(tun_name, config).await {
+    let mut conf = tun::Configuration::default();
+    conf.tun_name(tun_name);
+    // FIXME: boringtun doesn't like this, it prepends 4 bytes before the ip header of each packet read
+    //builder.enable_packet_information();
+    let tun = tun::create_as_async(&conf).unwrap_or_else(|err| {
+        log::error!("failed to create tun = {err:?}");
+        exit(1);
+    });
+
+    let _device_handle: DeviceHandle = match DeviceHandle::new(tun, config).await {
         Ok(d) => d,
         Err(e) => {
             // Notify parent that tunnel initialization failed

@@ -204,6 +204,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "tun",
 ]
 
 [[package]]
