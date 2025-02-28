@@ -3,7 +3,7 @@
 use std::{
     fmt::{self, Display},
     iter::Peekable,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     str::FromStr,
 };
 
@@ -161,6 +161,26 @@ pub struct Peer {
     /// IP entry will be removed from that peer and added to this peer.
     #[builder(default)]
     pub allowed_ip: Vec<AllowedIP>,
+
+    /// Exit hop
+    #[builder(default)]
+    pub exit_hop: Option<ExitPeer>,
+}
+
+#[derive(TypedBuilder, Debug)]
+#[non_exhaustive]
+pub struct ExitPeer {
+    /// Exit endpoint
+    #[builder(setter(into))]
+    pub tunnel_ip: Ipv4Addr,
+
+    /// Public key of the exit peer
+    #[builder(setter(into))]
+    pub public_key: KeyBytes,
+
+    /// Exit endpoint
+    #[builder(setter(into))]
+    pub endpoint: SocketAddr,
 }
 
 impl From<Set> for Request {
@@ -191,6 +211,7 @@ impl Peer {
             endpoint: None,
             persistent_keepalive_interval: None,
             allowed_ip: vec![],
+            exit_hop: None,
         }
     }
 }
@@ -285,6 +306,7 @@ impl Display for GetPeer {
                     endpoint,
                     persistent_keepalive_interval,
                     allowed_ip,
+                    exit_hop,
                 },
             last_handshake_time_sec,
             last_handshake_time_nsec,
@@ -303,6 +325,8 @@ impl Display for GetPeer {
             opt_to_key_and_display!(last_handshake_time_nsec),
             opt_to_key_and_display!(rx_bytes),
             opt_to_key_and_display!(tx_bytes),
+            // TODO
+            //opt_to_key_and_display!(exit_hop),
         ]
         .into_iter()
         .flatten();
@@ -450,6 +474,7 @@ impl SetPeer {
                     endpoint,
                     persistent_keepalive_interval,
                     allowed_ip,
+                    exit_hop: _,
                 },
             remove,
             update_only,

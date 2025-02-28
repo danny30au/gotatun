@@ -7,7 +7,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use crate::device::AllowedIps;
-use crate::noise::{Tunn, TunnResult};
+use crate::noise::TunnResult;
+
+use super::multihop;
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
@@ -16,7 +18,8 @@ pub struct Endpoint {
 
 pub struct Peer {
     /// The associated tunnel struct
-    pub(crate) tunnel: Tunn,
+    //pub(crate) tunnel: Tunn,
+    pub(crate) tunnel: multihop::AnyTunnel,
     /// The index the tunnel uses
     index: u32,
     endpoint: RwLock<Endpoint>,
@@ -50,7 +53,7 @@ impl FromStr for AllowedIP {
 
 impl Peer {
     pub fn new(
-        tunnel: Tunn,
+        tunnel: crate::device::multihop::AnyTunnel,
         index: u32,
         endpoint: Option<SocketAddr>,
         allowed_ips: &[AllowedIP],

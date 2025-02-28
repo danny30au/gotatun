@@ -10,6 +10,10 @@ pub mod drop_privileges;
 mod integration_tests;
 pub mod peer;
 
+pub mod multihop;
+
+use api::command::ExitPeer;
+use multihop::{MultihopConfig, MultihopTunnel};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -276,6 +280,7 @@ impl Device {
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
         preshared_key: Option<[u8; 32]>,
+        exit_hop: Option<ExitPeer>,
     ) {
         log::debug!("!!! update_peer");
 
@@ -296,15 +301,38 @@ impl Device {
             .as_ref()
             .expect("Private key must be set first");
 
-        let tunn = Tunn::new(
-            device_key_pair.0.clone(),
-            pub_key,
-            preshared_key,
-            keepalive,
-            next_index,
-            None,
-        );
+        let tunn = if let Some(exit_hop) = exit_hop {
+            multihop::AnyTunnel::Multihop(MultihopTunnel::new(MultihopConfig {
+                private_key: device_key_pair.0.clone(),
+                tunnel_ip: exit_hop.tunnel_ip,
+                entry_peer: pub_key,
+                entry_idx: next_index,
+                exit_idx: self.next_index(),
+                exit_peer: multihop::PeerConfig {
+                    public_key: x25519::PublicKey::from(exit_hop.public_key.0),
+                    endpoint: match exit_hop.endpoint {
+                        SocketAddr::V4(addr) => addr,
+                        _ => unimplemented!("help! v6 not implemented"),
+                    },
+                },
+            }))
+        } else {
+            log::debug!("!!!!!!!! OH NO");
+            log::debug!("!!!!!!!! OH NO");
+            log::debug!("!!!!!!!! OH NO");
+            log::debug!("!!!!!!!! OH NO");
+            log::debug!("!!!!!!!! OH NO");
+            multihop::AnyTunnel::Singlehop(Tunn::new(
+                device_key_pair.0.clone(),
+                pub_key,
+                preshared_key,
+                keepalive,
+                next_index,
+                None,
+            ))
+        };
 
+        //let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
 
         let peer = Arc::new(Mutex::new(peer));
@@ -550,46 +578,28 @@ impl Device {
         let udp3 = udp.clone();
         tokio::task::spawn(async move {
             while let Some((packet_owned, addr)) = dec_rx.recv().await {
-                let parsed_packet = match rate_limiter.verify_packet(
-                    Some(addr.ip()),
-                    packet_owned.packet(),
-                    &mut dst_buf,
-                ) {
-                    Ok(packet) => packet,
-                    Err(TunnResult::WriteToNetwork(cookie)) => {
-                        let _: Result<_, _> = udp3.send_to(cookie, &addr).await;
-                        let _ = buf_tx.send(packet_owned.buf);
-                        continue;
-                    }
-                    Err(_) => {
-                        let _ = buf_tx.send(packet_owned.buf);
-                        continue;
-                    }
-                };
-
                 let Some(device) = device.upgrade() else {
                     break;
                 };
                 let device_guard = &device.read().await;
                 let peers = &device_guard.peers;
-                let peers_by_idx = &device_guard.peers_by_idx;
-                let peer = match &parsed_packet {
-                    Packet::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
-                        .ok()
-                        .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public))),
-                    Packet::HandshakeResponse(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
-                    Packet::PacketCookieReply(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
-                    Packet::PacketData(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
-                };
-                let Some(peer) = peer else {
+
+                let Some(peer) = peers.values().next() else {
+                    log::debug!("!!!");
+                    log::debug!("!!! NO PEER");
+                    log::debug!("!!!");
                     let _ = buf_tx.send(packet_owned.buf);
                     continue;
                 };
-                let mut peer = peer.lock().await;
+                let mut peer_g = peer.lock().await;
+
+                // FIXME: always using first peer
+
                 let mut flush = false;
-                match peer
+                match peer_g
                     .tunnel
-                    .handle_verified_packet(parsed_packet, &mut dst_buf[..])
+                    //.entry_tun
+                    .decapsulate(Some(addr.ip()), packet_owned.packet(), &mut dst_buf)
                 {
                     TunnResult::Done => {}
                     TunnResult::Err(_) => {
@@ -602,14 +612,12 @@ impl Device {
                         let _: Result<_, _> = udp3.send_to(packet, &addr).await;
                     }
                     TunnResult::WriteToTunnelV4(packet, addr) => {
-                        if peer.is_allowed_ip(addr) {
-                            tun.send(packet).await.unwrap();
-                        }
+                        // TODO: allowed ips
+                        tun.send(packet).await.unwrap();
                     }
                     TunnResult::WriteToTunnelV6(packet, addr) => {
-                        if peer.is_allowed_ip(addr) {
-                            tun.send(packet).await.unwrap();
-                        }
+                        // TODO: allowed ips
+                        tun.send(packet).await.unwrap();
                     }
                 };
 
@@ -619,7 +627,8 @@ impl Device {
                 if flush {
                     // Flush pending queue
                     loop {
-                        match peer.tunnel.decapsulate(None, &[], &mut dst_buf[..]) {
+                        //match peer_g.tunnel.entry_tun.decapsulate(None, &[], &mut dst_buf[..]) {
+                        match peer_g.tunnel.decapsulate(None, &[], &mut dst_buf[..]) {
                             TunnResult::WriteToNetwork(packet) => {
                                 // TODO: why do we ignore this error?
                                 let _ = udp3.send_to(packet, &addr).await;
@@ -691,19 +700,16 @@ impl Device {
             };
             let src = &src_buf[..n];
 
-            let dst_addr = match Tunn::dst_address(src) {
-                Some(addr) => addr,
-                None => continue,
-            };
-
             let Some(device) = device.upgrade() else {
                 break;
             };
-            let peers = &device.read().await.peers_by_ip;
-            let mut peer = match peers.find(dst_addr) {
-                Some(peer) => peer.lock().await,
-                None => continue,
+            let peers = &device.read().await.peers;
+
+            // FIXME: always using first peer
+            let Some(peer) = peers.values().next() else {
+                continue;
             };
+            let mut peer = peer.lock().await;
 
             match peer.tunnel.encapsulate(src, &mut dst_buf) {
                 TunnResult::Done => {}

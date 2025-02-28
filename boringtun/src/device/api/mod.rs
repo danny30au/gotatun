@@ -295,6 +295,7 @@ async fn api_get(_: Get, d: &Device) -> GetResponse {
                     .allowed_ips()
                     .map(|(addr, cidr)| AllowedIP { addr, cidr })
                     .collect(),
+                exit_hop: None, // TODO
             },
             last_handshake_time_sec: peer.time_since_last_handshake().map(|d| d.as_secs()),
             last_handshake_time_nsec: peer.time_since_last_handshake().map(|d| d.subsec_nanos()),
@@ -376,6 +377,7 @@ async fn api_set(set: Set, device: &mut Device) -> (SetResponse, Reconfigure) {
                     endpoint,
                     persistent_keepalive_interval,
                     allowed_ip,
+                    exit_hop,
                 },
             remove,
             update_only,
@@ -401,6 +403,7 @@ async fn api_set(set: Set, device: &mut Device) -> (SetResponse, Reconfigure) {
             allowed_ip.as_slice(),
             persistent_keepalive_interval,
             preshared_key,
+            exit_hop,
         );
     }
 

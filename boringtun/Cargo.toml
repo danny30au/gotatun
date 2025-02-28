@@ -50,6 +50,8 @@ log = "*" # TODO
 typed-builder = "0.20.0"
 tun = { version = "0.7", features = ["async"] }
 
+etherparse = "0.13"
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.25", default-features = false, features = [
     "time",
