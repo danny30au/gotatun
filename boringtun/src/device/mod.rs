@@ -20,8 +20,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::join;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
 use tokio::sync::RwLock;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::noise::errors::WireGuardError;
@@ -86,7 +86,7 @@ pub struct DeviceConfig {
     pub api: Option<api::ConfigRx>,
 
     /// Used on Android to bypass UDP sockets.
-    pub on_bind: Option<Box<dyn FnMut (&UdpSocket) + Send + Sync>>,
+    pub on_bind: Option<Box<dyn FnMut(&UdpSocket) + Send + Sync>>,
 }
 
 impl Default for DeviceConfig {
@@ -97,7 +97,6 @@ impl Default for DeviceConfig {
             use_multi_queue: true,
             api: None,
             on_bind: None,
-
         }
     }
 }
@@ -126,7 +125,7 @@ pub struct Device {
     api: Option<Task>,
 
     /// Used on Android to bypass UDP sockets.
-    pub on_bind: Option<Box<dyn FnMut (&UdpSocket) + Send + Sync>>,
+    pub on_bind: Option<Box<dyn FnMut(&UdpSocket) + Send + Sync>>,
 }
 
 struct Task {
@@ -149,6 +148,12 @@ pub(crate) struct Connection {
 
     /// The task that reads traffic from the TUN device.
     outgoing: Task,
+
+    /// TODO: Document mee
+    decapsulatorz: mpsc::Sender<(Box<[u8]>, SocketAddr)>,
+
+    /// TODO: Document mee
+    decapsulatorz_ipv6: mpsc::Sender<(Box<[u8]>, SocketAddr)>,
 }
 
 impl Connection {
@@ -160,6 +165,15 @@ impl Connection {
         let udp4 = Arc::new(udp4);
         let udp6 = Arc::new(udp6);
 
+        // TODO: Explain
+        let (decapsulate_tx, mut decapsulate_rx): (mpsc::Sender<(Box<[u8]>, SocketAddr)>, _) =
+            mpsc::channel(5000);
+
+        let (decapsulate_tx_ipv6, mut decapsulate_rx_ipv6): (
+            mpsc::Sender<(Box<[u8]>, SocketAddr)>,
+            _,
+        ) = mpsc::channel(5000);
+
         let outgoing = Task::spawn(
             "handle_outgoing",
             Device::handle_outgoing(Arc::downgrade(&device), udp4.clone(), udp6.clone()),
@@ -170,11 +184,21 @@ impl Connection {
         );
         let incoming_ipv4 = Task::spawn(
             "handle_incoming ipv4",
-            Device::handle_incoming(Arc::downgrade(&device), udp4.clone()),
+            Device::handle_incoming(
+                Arc::downgrade(&device),
+                udp4.clone(),
+                decapsulate_tx.clone(),
+                decapsulate_rx,
+            ),
         );
         let incoming_ipv6 = Task::spawn(
             "handle_incoming ipv6",
-            Device::handle_incoming(Arc::downgrade(&device), udp6.clone()),
+            Device::handle_incoming(
+                Arc::downgrade(&device),
+                udp6.clone(),
+                decapsulate_tx_ipv6.clone(),
+                decapsulate_rx_ipv6,
+            ),
         );
 
         Ok(Connection {
@@ -185,6 +209,8 @@ impl Connection {
             incoming_ipv6,
             timers,
             outgoing,
+            decapsulatorz: decapsulate_tx,
+            decapsulatorz_ipv6: decapsulate_tx_ipv6,
         })
     }
 }
@@ -406,7 +432,6 @@ impl Device {
             setsockopt(udp_sock6.as_raw_fd(), sockopt::Mark, &mark).unwrap();
         }
 
-
         if let Some(bypass) = &mut self.on_bind {
             bypass(&udp_sock4);
             bypass(&udp_sock6);
@@ -522,7 +547,12 @@ impl Device {
     }
 
     /// Read from UDP socket, decapsulate, write to tunnel device
-    async fn handle_incoming(device: Weak<RwLock<Self>>, udp: Arc<UdpSocket>) -> Result<(), Error> {
+    async fn handle_incoming(
+        device: Weak<RwLock<Self>>,
+        udp: Arc<UdpSocket>,
+        decapsulate_tx: mpsc::Sender<(Box<[u8]>, SocketAddr)>,
+        decapsulate_rx: mpsc::Receiver<(Box<[u8]>, SocketAddr)>,
+    ) -> Result<(), Error> {
         let mut src_buf = [0u8; MAX_UDP_SIZE];
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
@@ -538,8 +568,6 @@ impl Device {
             (tun, private_key, public_key, rate_limiter)
         };
 
-        let (dec_tx, mut dec_rx): (mpsc::Sender<(Box<[u8]>, SocketAddr)>, _) = mpsc::channel(5000);
-        
         // let (send_tx, mut send_rx): (mpsc::Sender<(Box<[u8]>, SocketAddr)>, _) = mpsc::channel(5000);
         // let udp2 = udp.clone();
         // tokio::task::spawn(async move {
@@ -550,7 +578,7 @@ impl Device {
 
         let udp3 = udp.clone();
         tokio::task::spawn(async move {
-            while let Some((packet, addr)) = dec_rx.recv().await {
+            while let Some((packet, addr)) = decapsulate_rx.recv().await {
                 let parsed_packet =
                     match rate_limiter.verify_packet(Some(addr.ip()), &packet, &mut dst_buf) {
                         Ok(packet) => packet,
@@ -628,9 +656,11 @@ impl Device {
             })?;
 
             let boxed = Box::from(&src_buf[..packet_len]);
-            if let Err(mpsc::error::TrySendError::Full((boxed, addr))) =dec_tx.try_send((boxed, addr)) {
+            if let Err(mpsc::error::TrySendError::Full((boxed, addr))) =
+                decapsulate_tx.try_send((boxed, addr))
+            {
                 log::warn!("Back-pressure on dec_tx"); // TODO: remove this log
-                if dec_tx.send((boxed, addr)).await.is_err() {
+                if decapsulate_tx.send((boxed, addr)).await.is_err() {
                     return Ok(()); // Decryption task has been dropped
                 }
             }
