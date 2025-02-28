@@ -18,6 +18,7 @@ use std::ops::BitOrAssign;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use socket2::{Domain, Protocol, SockAddr, Type};
 use tokio::join;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -145,10 +146,10 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub async fn set_up(device: Arc<RwLock<Device>>) -> Result<Self, Error> {
-        let device_guard = device.read().await;
+    pub async fn set_up(device: Arc<RwLock<Device>>) -> Result<(), Error> {
+        let mut device_guard = device.write().await;
+
         let (udp4, udp6) = device_guard.open_listen_socket().await?;
-        drop(device_guard);
 
         let udp4 = Arc::new(udp4);
         let udp6 = Arc::new(udp6);
@@ -160,7 +161,7 @@ impl Connection {
             "handle_outgoing",
             async move {
                 let mut tasks = vec![];
-                for _ in 0..8 {
+                for _ in 0..16 {
                     tasks.push(Task::spawn(
                         "task",
                         Device::handle_outgoing(dev_copy.clone(), udp4_copy.clone(), udp6_copy.clone())
@@ -184,7 +185,7 @@ impl Connection {
             "handle_incoming ipv4",
             async move {
                 let mut tasks = vec![];
-                for _ in 0..8 {
+                for _ in 0..16 {
                     tasks.push(Task::spawn(
                         "task",
                         Device::handle_incoming(dev_copy.clone(), udp4_copy.clone())
@@ -199,10 +200,10 @@ impl Connection {
         );
         let incoming_ipv6 = Task::spawn(
             "handle_incoming ipv6",
-            Device::handle_incoming(device, udp6.clone()),
+            Device::handle_incoming(device.clone(), udp6.clone()),
         );
 
-        Ok(Connection {
+        device_guard.connection = Some(Connection {
             listen_port: udp4.local_addr()?.port(),
             udp4,
             udp6,
@@ -210,7 +211,9 @@ impl Connection {
             incoming_ipv6,
             timers,
             outgoing,
-        })
+        });
+
+        Ok(())
     }
 }
 
@@ -411,7 +414,16 @@ impl Device {
     ) -> Result<(tokio::net::UdpSocket, tokio::net::UdpSocket), Error> {
         let mut port = self.port;
         let addrv4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-        let udp_sock4 = tokio::net::UdpSocket::bind(addrv4).await?;
+        
+        let mut sock = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_nonblocking(true)?;
+        sock.bind(&SockAddr::from(addrv4))?;
+        sock.set_send_buffer_size(16 * 1024 * 1024)?;
+        sock.set_recv_buffer_size(16 * 1024 * 1024)?;
+        sock.set_reuse_address(true)?;
+
+        //let mut udp_sock4 = tokio::net::UdpSocket::bind(addrv4).await?;
+        let mut udp_sock4 = tokio::net::UdpSocket::from_std(std::net::UdpSocket::from(sock))?;
         if port == 0 {
             // Random port was assigned
             // TODO: we need REUSEADDR or something for both sockets to share a port.
@@ -505,10 +517,12 @@ impl Device {
 
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
+        log::debug!("handle_timers!");
+        let device = device.read().await;
+
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
 
-            let device = device.read().await;
             // TODO: pass in peers instead?
             let peer_map = &device.peers;
 
@@ -538,21 +552,20 @@ impl Device {
 
     /// Read from UDP socket, decapsulate, write to tunnel device
     async fn handle_incoming(device: Arc<RwLock<Self>>, udp: Arc<UdpSocket>) -> Result<(), Error> {
-        let device_lock = device.read().await;
+        log::debug!("handle_incoming!");
+        let device = device.read().await;
 
         // TODO: check every time. TODO: ordering
         // TODO: wrap MTU in arc, and clone it
-        let tun = device_lock.tun.clone();
+        let tun = device.tun.clone();
 
         let mut src_buf = [0u8; MAX_UDP_SIZE];
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
         // TODO: restart task if key pair is modified
         // Handler that handles anonymous packets over UDP
-        let (private_key, public_key) = device_lock.key_pair.clone().expect("Key not set");
-        let rate_limiter = device_lock.rate_limiter.clone().unwrap();
-
-        drop(device_lock);
+        let (private_key, public_key) = device.key_pair.clone().expect("Key not set");
+        let rate_limiter = device.rate_limiter.clone().unwrap();
 
         loop {
             // Loop while we have packets on the anonymous connection
@@ -573,9 +586,8 @@ impl Device {
                     Err(_) => continue,
                 };
 
-            let device_guard = &device.read().await;
-            let peers = &device_guard.peers;
-            let peers_by_idx = &device_guard.peers_by_idx;
+            let peers = &device.peers;
+            let peers_by_idx = &device.peers_by_idx;
             let peer = match &parsed_packet {
                 Packet::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
                     .ok()
@@ -630,6 +642,7 @@ impl Device {
         udp4: Arc<UdpSocket>,
         udp6: Arc<UdpSocket>,
     ) {
+        log::debug!("handle_outgoing!");
         let device_lock = device.read().await;
 
         // TODO: pass in peers and sockets instead of device?
@@ -641,7 +654,7 @@ impl Device {
         let mut src_buf = [0u8; MAX_UDP_SIZE];
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
-        drop(device_lock);
+        let device = device_lock;
 
         loop {
             let n = match tun.recv(&mut src_buf[..mtu]).await {
@@ -658,7 +671,7 @@ impl Device {
                 None => continue,
             };
 
-            let peers = &device.read().await.peers_by_ip;
+            let peers = &device.peers_by_ip;
             let mut peer = match peers.find(dst_addr) {
                 Some(peer) => peer.lock().await,
                 None => continue,

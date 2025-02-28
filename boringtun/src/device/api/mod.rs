@@ -220,10 +220,8 @@ impl Device {
                     drop(device_guard);
 
                     if reconfigure == Reconfigure::Yes {
-                        match Connection::set_up(device.clone()).await {
-                            Ok(con) => {
-                                let mut device_guard = device.write().await;
-                                device_guard.connection = Some(con);
+                        match Connection::set_up(device).await {
+                            Ok(()) => {
                                 Response::Set(response)
                             }
                             Err(err) => {
