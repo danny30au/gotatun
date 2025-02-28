@@ -22,6 +22,9 @@ pub struct Peer {
     endpoint: RwLock<Endpoint>,
     allowed_ips: AllowedIps<()>,
     preshared_key: Option<[u8; 32]>,
+    #[cfg(feature = "daita")]
+    // TODO: Replace rng
+    daita: Option<crate::daita::Daita<std::sync::Arc<[maybenot::Machine]>, rand_core::RngCore>>,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -59,9 +62,7 @@ impl Peer {
         Peer {
             tunnel,
             index,
-            endpoint: RwLock::new(Endpoint {
-                addr: endpoint,
-            }),
+            endpoint: RwLock::new(Endpoint { addr: endpoint }),
             allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),
             preshared_key,
         }

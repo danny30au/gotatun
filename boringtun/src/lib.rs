@@ -8,6 +8,9 @@
 #[cfg(feature = "device")]
 pub mod device;
 
+#[cfg(feature = "daita")]
+pub mod daita;
+
 #[cfg(feature = "ffi-bindings")]
 pub mod ffi;
 #[cfg(feature = "jni-bindings")]
