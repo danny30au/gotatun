@@ -25,6 +25,8 @@ use crate::{
     x25519,
 };
 
+use super::MAX_UDP_SIZE;
+
 pub enum AnyTunnel {
     Singlehop(Tunn),
     Multihop(MultihopTunnel),
@@ -106,6 +108,7 @@ pub struct MultihopTunnel {
     tunnel_ip: Ipv4Addr,
     exit_endpoint: SocketAddrV4,
     inner_tun_port: u16,
+    buffer: Option<Vec<u8>>,
 }
 
 pub struct MultihopConfig {
@@ -166,12 +169,13 @@ impl MultihopTunnel {
             tunnel_ip: config.tunnel_ip,
             exit_endpoint: config.exit_peer.endpoint,
             inner_tun_port,
+            buffer: None,
         }
     }
 
     pub fn update_timers<'a>(&mut self, mut dst: &'a mut [u8]) -> TunnResult<'a> {
-        // FIXME
-        let mut horrible_dst = vec![0u8; dst.len()];
+        let _ = self.buffer.get_or_insert_with(|| vec![0u8; MAX_UDP_SIZE]);
+        let mut horrible_dst = self.buffer.take().unwrap();
 
         // If the entry tun wants to write, return immediately
         match self.entry_tun.update_timers(&mut horrible_dst) {
@@ -184,16 +188,22 @@ impl MultihopTunnel {
                 // TODO: fine to assume position is unchanged?
                 let new_packet = &mut dst[..packet.len()];
                 new_packet.copy_from_slice(&packet);
+
+                self.buffer = Some(horrible_dst);
+
                 return TunnResult::WriteToNetwork(new_packet);
             }
             // If exit wants nothing, continue with exit timers
             TunnResult::Done => (),
-            TunnResult::Err(err) => return TunnResult::Err(err),
+            TunnResult::Err(err) => {
+                self.buffer = Some(horrible_dst);
+                return TunnResult::Err(err);
+            }
             _other => unreachable!("unexpected tunnel result from update_timers"),
         }
 
         // Encapsulate any traffic destined for the exit an extra time
-        match self.exit_tun.update_timers(&mut dst) {
+        let result = match self.exit_tun.update_timers(&mut dst) {
             TunnResult::WriteToNetwork(packet) => {
                 //log::debug!("!!!!");
                 //log::debug!("!!!! exit -> update -> write to network");
@@ -206,7 +216,11 @@ impl MultihopTunnel {
             TunnResult::Done => TunnResult::Done,
             TunnResult::Err(err) => TunnResult::Err(err),
             _other => unreachable!("unexpected tunnel result from update_timers"),
-        }
+        };
+
+        self.buffer = Some(horrible_dst);
+
+        result
     }
 
     /// Encapsulate a packet for the exit endpoint
@@ -214,13 +228,10 @@ impl MultihopTunnel {
     /// This function sends everything to the exit, by encapsulating data first using the exit tun
     /// and then the entry tun.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
-        // FIXME: do not encapsulate handshake initiation for entry...
-        //        figure out if WriteToNetwork is due to handshake
+        let _ = self.buffer.get_or_insert_with(|| vec![0u8; MAX_UDP_SIZE]);
+        let mut horrible_dst = self.buffer.take().unwrap();
 
-        // FIXME
-        let mut horrible_dst = vec![0u8; dst.len()];
-
-        match self.exit_tun.encapsulate(src, dst) {
+        let result = match self.exit_tun.encapsulate(src, dst) {
             TunnResult::Done => TunnResult::Done,
             TunnResult::Err(e) => TunnResult::Err(e),
             TunnResult::WriteToNetwork(packet) => {
@@ -235,7 +246,11 @@ impl MultihopTunnel {
                 //TunnResult::WriteToNetwork(packet)
             }
             _ => panic!("Unexpected result from encapsulate"),
-        }
+        };
+
+        self.buffer = Some(horrible_dst);
+
+        result
     }
 
     /// Decapsulate a packet by first decrypting it with the exit, and then the entry, tun.
@@ -249,14 +264,12 @@ impl MultihopTunnel {
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        // FIXME
-        let mut horrible_dst = vec![0u8; dst.len()];
-
-        // TODO: non-data packets for entry
+        let _ = self.buffer.get_or_insert_with(|| vec![0u8; MAX_UDP_SIZE]);
+        let mut horrible_dst = self.buffer.take().unwrap();
 
         //log::debug!("!!!! decap SRC: {src_addr:?}");
 
-        match self
+        let result = match self
             .entry_tun
             .decapsulate(src_addr, datagram, &mut horrible_dst)
         {
@@ -280,6 +293,9 @@ impl MultihopTunnel {
                     // TODO: what is correct behavior?
                     let new_packet = &mut dst[..packet.len()];
                     new_packet.copy_from_slice(&packet);
+
+                    self.buffer = Some(horrible_dst);
+
                     return TunnResult::WriteToTunnelV4(new_packet, addr);
                 }
 
@@ -304,7 +320,11 @@ impl MultihopTunnel {
                 //self.exit_tun.decapsulate(src_addr, packet, dst)
                 todo!()
             }
-        }
+        };
+
+        self.buffer = Some(horrible_dst);
+
+        result
     }
 
     pub fn stats(&self) -> (Option<Duration>, usize, usize, f32, Option<u32>) {
