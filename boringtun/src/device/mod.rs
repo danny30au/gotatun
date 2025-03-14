@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 pub mod allowed_ips;
+pub mod buffer_pool;
 
 pub mod api;
 #[cfg(unix)]
@@ -10,6 +11,7 @@ pub mod drop_privileges;
 mod integration_tests;
 pub mod peer;
 
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -523,7 +525,7 @@ impl Device {
     async fn handle_incoming(device: Weak<RwLock<Self>>, udp: Arc<UdpSocket>) -> Result<(), Error> {
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
-        let (buf_tx, mut buf_rx) = mpsc::unbounded_channel::<Box<[u8; 4096]>>();
+        let mut buffer_pool = buffer_pool::BufferPool::new(16 * MAX_UDP_SIZE);
 
         let (tun, private_key, public_key, rate_limiter) = {
             let Some(device) = device.upgrade() else {
@@ -549,20 +551,18 @@ impl Device {
 
         let udp3 = udp.clone();
         tokio::task::spawn(async move {
-            while let Some((packet_owned, addr)) = dec_rx.recv().await {
+            while let Some((packet_buf, addr)) = dec_rx.recv().await {
                 let parsed_packet = match rate_limiter.verify_packet(
                     Some(addr.ip()),
-                    packet_owned.packet(),
+                    &packet_buf.data[..],
                     &mut dst_buf,
                 ) {
                     Ok(packet) => packet,
                     Err(TunnResult::WriteToNetwork(cookie)) => {
                         let _: Result<_, _> = udp3.send_to(cookie, &addr).await;
-                        let _ = buf_tx.send(packet_owned.buf);
                         continue;
                     }
                     Err(_) => {
-                        let _ = buf_tx.send(packet_owned.buf);
                         continue;
                     }
                 };
@@ -582,7 +582,6 @@ impl Device {
                     Packet::PacketData(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
                 };
                 let Some(peer) = peer else {
-                    let _ = buf_tx.send(packet_owned.buf);
                     continue;
                 };
                 let mut peer = peer.lock().await;
@@ -593,7 +592,6 @@ impl Device {
                 {
                     TunnResult::Done => {}
                     TunnResult::Err(_) => {
-                        let _ = buf_tx.send(packet_owned.buf);
                         continue;
                     }
                     TunnResult::WriteToNetwork(packet) => {
@@ -612,9 +610,6 @@ impl Device {
                         }
                     }
                 };
-
-                // Send the buffer back to be reclaimed
-                let _ = buf_tx.send(packet_owned.buf);
 
                 if flush {
                     // Flush pending queue
@@ -637,15 +632,16 @@ impl Device {
         });
 
         loop {
-            let mut buf = buf_rx.try_recv().unwrap_or_else(|_| datagram_buffer());
+            let buf: &mut [u8] = buffer_pool.borrow_mut(MAX_UDP_SIZE);
 
             // Read packets from the socket.
-            let (packet_len, addr) = udp.recv_from(&mut buf[..]).await.map_err(|e| {
+            let (packet_len, addr) = udp.recv_from(buf).await.map_err(|e| {
                 log::error!("UDP recv_from error {e:?}");
                 Error::IoError(e)
             })?;
 
-            let packet_buf = PacketBuf { packet_len, buf };
+            let data = buffer_pool.take(packet_len).freeze();
+            let packet_buf = PacketBuf { data };
 
             if let Err(mpsc::error::TrySendError::Full((packet_buf, addr))) =
                 dec_tx.try_send((packet_buf, addr))
@@ -751,14 +747,7 @@ pub fn datagram_buffer() -> Box<[u8; 4096]> {
 }
 
 struct PacketBuf {
-    pub packet_len: usize,
-    pub buf: Box<[u8; 4096]>,
-}
-
-impl PacketBuf {
-    pub fn packet(&self) -> &[u8] {
-        &self.buf[..self.packet_len]
-    }
+    pub data: Bytes,
 }
 
 impl IndexLfsr {

@@ -165,6 +165,7 @@ dependencies = [
  "aead",
  "base64",
  "blake2",
+ "bytes",
  "chacha20poly1305",
  "criterion",
  "etherparse",
@@ -232,9 +233,9 @@ checksum = "0d261e256854913907f67ed06efbc3338dfe6179796deefc1ff763fc1aee5535"
 
 [[package]]
 name = "bytes"
-version = "1.1.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4872d67bab6358e59559027aa3b9157c53d9358c51423c17554809a8858e0f8"
+checksum = "f61dac84819c6588b558454b194026eb1f09c293b9036ae9b159e74e73ab6cf9"
 
 [[package]]
 name = "c2rust-bitfields"
