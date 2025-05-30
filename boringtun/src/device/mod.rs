@@ -10,15 +10,16 @@ pub mod drop_privileges;
 mod integration_tests;
 pub mod peer;
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::future::Future;
-use std::io;
+use std::io::{self, IoSlice};
+use std::iter;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::BitOrAssign;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use async_trait::async_trait;
 use tokio::join;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -104,7 +105,10 @@ impl Default for DeviceConfig {
 
 #[async_trait]
 pub trait UdpTransportFactory: Send + Sync {
-    async fn bind(&mut self, params: &UdpTransportFactoryParams) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)>;
+    async fn bind(
+        &mut self,
+        params: &UdpTransportFactoryParams,
+    ) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)>;
 }
 
 pub struct UdpSocketFactory;
@@ -120,7 +124,9 @@ pub struct UdpTransportFactoryParams {
 
 #[async_trait]
 impl UdpTransportFactory for UdpSocketFactory {
-    async fn bind(&mut self, params: &UdpTransportFactoryParams,
+    async fn bind(
+        &mut self,
+        params: &UdpTransportFactoryParams,
     ) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)> {
         fn bind(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
             let domain = match addr {
@@ -159,9 +165,20 @@ impl UdpTransportFactory for UdpSocketFactory {
 
 #[async_trait]
 pub trait UdpTransport: Send + Sync {
-    async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<usize>;
+    async fn send_to(&self, packets: &[u8], target: SocketAddr) -> io::Result<()>;
+    async fn send_many_to(&self, packets: &[(PacketBuf, SocketAddr)]) -> io::Result<()> {
+        for (packet, target) in packets {
+            self.send_to(packet.packet(), *target).await?;
+        }
+        Ok(())
+    }
+
+    fn max_number_of_packets_to_send(&self) -> usize {
+        1
+    }
+
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    //async fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
     fn local_addr(&self) -> io::Result<SocketAddr>;
     #[cfg(target_os = "linux")]
     fn set_fwmark(&self, mark: u32) -> io::Result<()>;
@@ -169,17 +186,59 @@ pub trait UdpTransport: Send + Sync {
 
 #[async_trait]
 impl UdpTransport for tokio::net::UdpSocket {
-    async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<usize> {
-        self.send_to(data, target).await
-
-        // TODO:
-        //nix::sys::socket::sendmmsg();
+    async fn send_to(&self, packet: &[u8], target: SocketAddr) -> io::Result<()> {
+        self.send_to(packet, target).await?;
+        Ok(())
     }
 
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    async fn send_many_to(&self, packets: &[(PacketBuf, SocketAddr)]) -> io::Result<()> {
+        use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrStorage};
+        use std::os::fd::{AsFd, AsRawFd};
+        use tokio::io::Interest;
+
+        //log::info!("send_to_many {}", packets.len());
+
+        let fd = self.as_fd().as_raw_fd();
+
+        let addrs = packets
+            .into_iter()
+            .map(|(_packet, target)| Some(SockaddrStorage::from(*target)))
+            .collect::<Vec<_>>();
+
+        let packets = packets
+            .into_iter()
+            .map(|(packet_buf, _target)| [IoSlice::new(packet_buf.packet())])
+            .collect::<Vec<_>>();
+
+        self.async_io(Interest::WRITABLE, || {
+            let mut multiheaders = MultiHeaders::preallocate(packets.len(), None);
+            nix::sys::socket::sendmmsg(
+                fd,
+                &mut multiheaders,
+                packets.iter(),
+                &addrs,
+                &[],
+                MsgFlags::empty(),
+            )?;
+
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn max_number_of_packets_to_send(&self) -> usize {
+        100
+    }
+
+    /*async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.recv(buf).await
-    }
+    }*/
 
+    // TODO: recvmmsg
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.recv_from(buf).await
@@ -188,12 +247,11 @@ impl UdpTransport for tokio::net::UdpSocket {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.local_addr()
     }
-    
+
     #[cfg(target_os = "linux")]
     fn set_fwmark(&self, mark: u32) -> io::Result<()> {
         use nix::sys::socket::{setsockopt, sockopt};
-        use std::os::fd::AsRawFd;
-        setsockopt(self.as_raw_fd(), sockopt::Mark, &mark)?;
+        setsockopt(&self, sockopt::Mark, &mark)?;
         Ok(())
     }
 }
@@ -284,7 +342,11 @@ impl Connection {
 }
 
 impl DeviceHandle {
-    pub async fn new(udp_factory: impl UdpTransportFactory + 'static, device: AsyncDevice, config: DeviceConfig) -> Result<DeviceHandle, Error> {
+    pub async fn new(
+        udp_factory: impl UdpTransportFactory + 'static,
+        device: AsyncDevice,
+        config: DeviceConfig,
+    ) -> Result<DeviceHandle, Error> {
         Ok(DeviceHandle {
             device: Device::new(udp_factory, device, config).await?,
         })
@@ -558,7 +620,6 @@ impl Device {
 
     #[cfg(any(target_os = "fuchsia", target_os = "linux"))]
     fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
-
         self.fwmark = Some(mark);
 
         if let Some(conn) = &mut self.connection {
@@ -583,7 +644,11 @@ impl Device {
         self.peers_by_ip.clear();
     }
 
-    async fn handle_timers(device: Weak<RwLock<Self>>, udp4: Arc<dyn UdpTransport>, udp6: Arc<dyn UdpTransport>) {
+    async fn handle_timers(
+        device: Weak<RwLock<Self>>,
+        udp4: Arc<dyn UdpTransport>,
+        udp6: Arc<dyn UdpTransport>,
+    ) {
         // TODO: fix rate limiting
         /*
         self.queue.new_periodic_event(
@@ -635,7 +700,10 @@ impl Device {
     }
 
     /// Read from UDP socket, decapsulate, write to tunnel device
-    async fn handle_incoming(device: Weak<RwLock<Self>>, udp: Arc<dyn UdpTransport>) -> Result<(), Error> {
+    async fn handle_incoming(
+        device: Weak<RwLock<Self>>,
+        udp: Arc<dyn UdpTransport>,
+    ) -> Result<(), Error> {
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
         let (buf_tx, mut buf_rx) = mpsc::unbounded_channel::<Box<[u8; 4096]>>();
@@ -797,6 +865,22 @@ impl Device {
                     log::info!("Incoming buffer count: {buf_count}");
                     datagram_buffer()
                 });
+
+                // TODO: recvmmsg
+                /*
+                pub fn recvmmsg<'a, XS, S, I>(
+                    fd: RawFd,
+                    data: &'a mut MultiHeaders<S>,
+                    slices: XS,
+                    flags: MsgFlags,
+                    timeout: Option<TimeSpec>,
+                ) -> Result<MultiResults<'a, S>>
+                where
+                    XS: IntoIterator<Item = &'a mut I>,
+                    I: AsMut<[IoSliceMut<'a>]> + 'a,*/
+
+                //nix::sys::socket::recvmmsg(fd, data, flags, timeout)
+
                 // Read packets from the socket.
                 let (packet_len, addr) = udp.recv_from(&mut buf[..]).await.map_err(|e| {
                     log::error!("UDP recv_from error {e:?}");
@@ -937,9 +1021,33 @@ impl Device {
 
         let buf_tx_v4 = buf_tx.clone();
         let send_task_v4 = tokio::task::spawn(async move {
+            let mut buf = vec![];
+            let max_number_of_packets_to_send = udp4.max_number_of_packets_to_send();
+
             while let Some((packet_buf, addr)) = packet_v4_rx.recv().await {
-                let _: Result<_, _> = udp4.send_to(packet_buf.packet(), addr.into()).await;
-                let _ = buf_tx_v4.send(packet_buf.buf);
+                buf.clear();
+
+                if packet_v4_rx.is_empty() {
+                    let _ = udp4.send_to(packet_buf.packet(), addr.into()).await;
+                    let _ = buf_tx_v4.send(packet_buf.buf);
+                } else {
+                    // collect as many packets as possible into a buffer
+                    [(packet_buf, addr)]
+                        .into_iter()
+                        .chain(iter::from_fn(|| packet_v4_rx.try_recv().ok()))
+                        .take(max_number_of_packets_to_send)
+                        .for_each(|(packet_buf, target)| buf.push((packet_buf, target.into())));
+
+                    // send all packets at once
+                    let _ = udp4
+                        .send_many_to(&buf)
+                        .await
+                        .inspect_err(|e| log::warn!("send_to_many_err: {e:#}"));
+
+                    for (packet_buf, _) in buf.drain(..) {
+                        let _ = buf_tx_v4.send(packet_buf.buf);
+                    }
+                }
             }
         });
         let buf_tx_v6 = buf_tx.clone();
@@ -983,7 +1091,7 @@ pub fn datagram_buffer() -> Box<[u8; 4096]> {
     Box::new([0u8; 4096])
 }
 
-struct PacketBuf {
+pub struct PacketBuf {
     pub packet_len: usize,
     pub buf: Box<[u8; 4096]>,
 }
