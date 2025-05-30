@@ -143,7 +143,7 @@ mod unix {
             on_bind: None,
         };
 
-        let _device_handle: DeviceHandle =
+        let _device_handle =
             match DeviceHandle::from_tun_name(UdpSocketFactory, tun_name, config).await {
                 Ok(d) => d,
                 Err(e) => {

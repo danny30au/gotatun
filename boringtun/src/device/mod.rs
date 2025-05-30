@@ -78,8 +78,8 @@ pub enum Error {
     OpenDevice(#[from] tun::Error),
 }
 
-pub struct DeviceHandle {
-    device: Arc<RwLock<Device>>,
+pub struct DeviceHandle<UF: UdpTransportFactory> {
+    device: Arc<RwLock<Device<UF>>>,
 }
 
 type OnBindCallback = Box<dyn FnMut(&UdpSocket) + Send + Sync>;
@@ -103,7 +103,7 @@ impl Default for DeviceConfig {
     }
 }
 
-pub struct Device {
+pub struct Device<UF: UdpTransportFactory> {
     key_pair: Option<(x25519::StaticSecret, x25519::PublicKey)>,
     fwmark: Option<u32>,
 
@@ -121,8 +121,8 @@ pub struct Device {
     rate_limiter: Option<Arc<RateLimiter>>,
 
     port: u16,
-    udp_factory: Box<dyn UdpTransportFactory>,
-    connection: Option<Connection>,
+    udp_factory: Box<UF>,
+    connection: Option<Connection<UF>>,
 
     /// The task that responds to API requests.
     api: Option<Task>,
@@ -135,9 +135,9 @@ struct Task {
     name: &'static str,
     handle: Option<JoinHandle<()>>,
 }
-pub(crate) struct Connection {
-    udp4: Arc<dyn UdpTransport>,
-    udp6: Arc<dyn UdpTransport>,
+pub(crate) struct Connection<UF: UdpTransportFactory> {
+    udp4: Arc<UF::Transport>,
+    udp6: Arc<UF::Transport>,
     listen_port: u16,
 
     /// The task that reads IPv4 traffic from the UDP socket.
@@ -153,8 +153,8 @@ pub(crate) struct Connection {
     outgoing: Task,
 }
 
-impl Connection {
-    pub async fn set_up(device: Arc<RwLock<Device>>) -> Result<Self, Error> {
+impl<UF: UdpTransportFactory> Connection<UF> {
+    pub async fn set_up(device: Arc<RwLock<Device<UF>>>) -> Result<Self, Error> {
         let mut device_guard = device.write().await;
         let (udp4, udp6) = device_guard.open_listen_socket().await?;
         drop(device_guard);
@@ -188,22 +188,22 @@ impl Connection {
     }
 }
 
-impl DeviceHandle {
+impl<UF: UdpTransportFactory> DeviceHandle<UF> {
     pub async fn new(
-        udp_factory: impl UdpTransportFactory + 'static,
+        udp_factory: UF,
         device: AsyncDevice,
         config: DeviceConfig,
-    ) -> Result<DeviceHandle, Error> {
+    ) -> Result<DeviceHandle<UF>, Error> {
         Ok(DeviceHandle {
             device: Device::new(udp_factory, device, config).await?,
         })
     }
 
     pub async fn from_tun_name(
-        udp_factory: impl UdpTransportFactory + 'static,
+        udp_factory: UF,
         tun_name: &str,
         config: DeviceConfig,
-    ) -> Result<DeviceHandle, Error> {
+    ) -> Result<DeviceHandle<UF>, Error> {
         let mut tun_config = tun::Configuration::default();
         tun_config.tun_name(tun_name);
         #[cfg(target_os = "macos")]
@@ -218,7 +218,7 @@ impl DeviceHandle {
         Self::stop_inner(self.device.clone()).await
     }
 
-    async fn stop_inner(device: Arc<RwLock<Device>>) {
+    async fn stop_inner(device: Arc<RwLock<Device<UF>>>) {
         log::debug!("Stopping boringtun device");
 
         let mut device = device.write().await;
@@ -238,7 +238,7 @@ impl DeviceHandle {
     }
 }
 
-impl Drop for DeviceHandle {
+impl<UF: UdpTransportFactory> Drop for DeviceHandle<UF> {
     fn drop(&mut self) {
         log::debug!("Dropping boringtun device");
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -273,7 +273,7 @@ impl BitOrAssign for Reconfigure {
     }
 }
 
-impl Device {
+impl<UF: UdpTransportFactory> Device<UF> {
     fn next_index(&mut self) -> u32 {
         self.next_index.next()
     }
@@ -350,10 +350,10 @@ impl Device {
     }
 
     pub async fn new(
-        udp_factory: impl UdpTransportFactory + 'static,
+        udp_factory: UF,
         tun: tun::AsyncDevice,
         config: DeviceConfig,
-    ) -> Result<Arc<RwLock<Device>>, Error> {
+    ) -> Result<Arc<RwLock<Device<UF>>>, Error> {
         // Create a tunnel device
         //let tun = Arc::new(TunSocket::new(tun_name_or_fd)?.set_non_blocking()?);
         // TODO: nonblocking
@@ -418,7 +418,7 @@ impl Device {
     /// Bind two UDP sockets. One for IPv4, one for IPv6.
     async fn open_listen_socket(
         &mut self,
-    ) -> Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>), Error> {
+    ) -> Result<(Arc<UF::Transport>, Arc<UF::Transport>), Error> {
         let params = UdpTransportFactoryParams {
             addr_v4: Ipv4Addr::UNSPECIFIED,
             addr_v6: Ipv6Addr::UNSPECIFIED,
@@ -493,12 +493,9 @@ impl Device {
 
     async fn handle_timers(
         device: Weak<RwLock<Self>>,
-        udp4: Arc<dyn UdpTransport>,
-        udp6: Arc<dyn UdpTransport>,
+        udp4: Arc<UF::Transport>,
+        udp6: Arc<UF::Transport>,
     ) {
-        let mut udp4 = udp4.clone_lol();
-        let mut udp6 = udp6.clone_lol();
-
         // TODO: fix rate limiting
         /*
         self.queue.new_periodic_event(
@@ -552,7 +549,7 @@ impl Device {
     /// Read from UDP socket, decapsulate, write to tunnel device
     async fn handle_incoming(
         device: Weak<RwLock<Self>>,
-        udp: Arc<dyn UdpTransport>,
+        udp: Arc<UF::Transport>,
     ) -> Result<(), Error> {
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
@@ -574,7 +571,7 @@ impl Device {
         let (send_udp_tx, mut send_udp_rx) = mpsc::channel::<(PacketBuf, SocketAddr)>(5000);
         let (send_tun_tx, mut send_tun_rx) = mpsc::channel::<PacketBuf>(5000);
 
-        let mut udp_send = udp.clone_lol();
+        let udp_send = udp.clone();
         let buf_tx_udp = buf_tx.clone();
         let send_task_udp = tokio::task::spawn(async move {
             while let Some((packet_buf, addr)) = send_udp_rx.recv().await {
@@ -591,7 +588,7 @@ impl Device {
         });
 
         let buf_tx_encapsulate = buf_tx.clone();
-        let mut udp_send_flush = udp.clone_lol(); // TODO: do we need this?
+        let udp_send_flush = udp.clone(); // TODO: do we need this?
         let encapsulate_task = tokio::task::spawn(async move {
             while let Some((packet_owned, addr)) = dec_rx.recv().await {
                 let parsed_packet = match rate_limiter.verify_packet(
@@ -732,7 +729,10 @@ impl Device {
                 // Read packets from the socket.
                 // TODO: src in PacketBuf?
                 let num_packets = udp
-                    .recv_vectored(&mut packet_bufs[..n_available_bufs], &mut source_addrs[..n_available_bufs])
+                    .recv_vectored(
+                        &mut packet_bufs[..n_available_bufs],
+                        &mut source_addrs[..n_available_bufs],
+                    )
                     .await
                     .map_err(|e| {
                         log::error!("UDP recv_from error {e:?}");
@@ -775,12 +775,9 @@ impl Device {
     /// Read from tunnel device, encapsulate, and write to UDP socket for the corresponding peer
     async fn handle_outgoing(
         device: Weak<RwLock<Self>>,
-        udp4: Arc<dyn UdpTransport>,
-        udp6: Arc<dyn UdpTransport>,
+        udp4: Arc<UF::Transport>,
+        udp6: Arc<UF::Transport>,
     ) {
-        let mut udp4 = udp4.clone_lol();
-        let mut udp6 = udp6.clone_lol();
-
         let (mtu, tun) = {
             let Some(device) = device.upgrade() else {
                 return;
@@ -886,6 +883,7 @@ impl Device {
         let send_task_v4 = tokio::task::spawn(async move {
             let mut buf = vec![];
             let max_number_of_packets_to_send = udp4.max_number_of_packets_to_send();
+            let mut send_many_buf = Default::default();
 
             while let Some((packet_buf, addr)) = packet_v4_rx.recv().await {
                 buf.clear();
@@ -903,7 +901,7 @@ impl Device {
 
                     // send all packets at once
                     let _ = udp4
-                        .send_many_to(&buf)
+                        .send_many_to(&mut send_many_buf, &buf)
                         .await
                         .inspect_err(|e| log::warn!("send_to_many_err: {e:#}"));
 
@@ -1001,7 +999,7 @@ impl Default for IndexLfsr {
     }
 }
 
-impl Connection {
+impl<UF: UdpTransportFactory> Connection<UF> {
     async fn stop(self) {
         let Self {
             udp4,
@@ -1085,7 +1083,7 @@ impl Task {
     }
 }
 
-impl Drop for Device {
+impl<UF: UdpTransportFactory> Drop for Device<UF> {
     fn drop(&mut self) {
         log::info!("Stopping Device");
     }

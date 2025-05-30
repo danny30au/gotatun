@@ -5,19 +5,25 @@ use std::{
 };
 
 use async_trait::async_trait;
-use linux::VectorizedUdpSocket;
 
 use crate::device::PacketBuf;
 
 #[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(not(target_os = "linux"))]
+mod generic;
+
 #[async_trait]
 pub trait UdpTransport: Send + Sync {
-    fn clone_lol(&self) -> Box<dyn UdpTransport>;
+    type SendManyBuf: Default + Send + Sync;
 
-    async fn send_to(&mut self, packets: &[u8], target: SocketAddr) -> io::Result<()>;
-    async fn send_many_to(&mut self, packets: &[(PacketBuf, SocketAddr)]) -> io::Result<()> {
+    async fn send_to(&self, packets: &[u8], target: SocketAddr) -> io::Result<()>;
+    async fn send_many_to(
+        &self,
+        _bufs: &mut Self::SendManyBuf,
+        packets: &[(PacketBuf, SocketAddr)],
+    ) -> io::Result<()> {
         for (packet, target) in packets {
             self.send_to(packet.packet(), *target).await?;
         }
@@ -34,11 +40,20 @@ pub trait UdpTransport: Send + Sync {
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
     //async fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Returns the number of packets received. 'bufs' and 'source_addrs' receive packets and
+    /// the source of each buf, respectively.
+    ///
+    /// # Arguments
+    /// - `bufs` - A slice of buffers that will receive UDP datagrams.
+    /// - 'source_addrs' - Source addresses to receive. The length must equal that of 'bufs'.
     async fn recv_vectored(
         &self,
-        bufs: &mut [PacketBuf],
-        source_addrs: &mut [Option<SocketAddr>],
-    ) -> io::Result<usize>;
+        _bufs: &mut [PacketBuf],
+        _source_addrs: &mut [Option<SocketAddr>],
+    ) -> io::Result<usize> {
+        todo!("implement using recv_from")
+    }
     fn local_addr(&self) -> io::Result<SocketAddr>;
     #[cfg(target_os = "linux")]
     fn set_fwmark(&self, mark: u32) -> io::Result<()>;
@@ -54,67 +69,25 @@ pub struct UdpTransportFactoryParams {
 }
 
 #[async_trait]
-pub trait UdpTransportFactory: Send + Sync {
+pub trait UdpTransportFactory: Send + Sync + 'static {
+    type Transport: UdpTransport + 'static;
+
     async fn bind(
         &mut self,
         params: &UdpTransportFactoryParams,
-    ) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)>;
+    ) -> io::Result<(Arc<Self::Transport>, Arc<Self::Transport>)>;
 }
 
 pub struct UdpSocketFactory;
 
 #[async_trait]
-impl UdpTransport for Arc<tokio::net::UdpSocket> {
-    fn clone_lol(&self) -> Box<dyn UdpTransport> {
-        Box::new(Arc::clone(self))
-    }
-
-    async fn send_to(&mut self, packet: &[u8], target: SocketAddr) -> io::Result<()> {
-        tokio::net::UdpSocket::send_to(self, packet, target).await?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn max_number_of_packets_to_recv(&self) -> usize {
-        100
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        tokio::net::UdpSocket::recv_from(self, buf).await
-    }
-
-    /// Returns the number of packets received. 'bufs' and 'source_addrs' receive packets and
-    /// the source of each buf, respectively.
-    ///
-    /// # Arguments
-    /// - `bufs` - A slice of buffers that will receive UDP datagrams.
-    /// - 'source_addrs' - Source addresses to receive. The length must equal that of 'bufs'.
-    async fn recv_vectored(
-        &self,
-        _bufs: &mut [PacketBuf],
-        _source_addrs: &mut [Option<SocketAddr>],
-    ) -> io::Result<usize> {
-        todo!("implement using recv_from")
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        tokio::net::UdpSocket::local_addr(self)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn set_fwmark(&self, mark: u32) -> io::Result<()> {
-        use nix::sys::socket::{setsockopt, sockopt};
-        setsockopt(&self, sockopt::Mark, &mark)?;
-        Ok(())
-    }
-}
-
-#[async_trait]
 impl UdpTransportFactory for UdpSocketFactory {
+    type Transport = tokio::net::UdpSocket;
+
     async fn bind(
         &mut self,
         params: &UdpTransportFactoryParams,
-    ) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)> {
+    ) -> io::Result<(Arc<Self::Transport>, Arc<Self::Transport>)> {
         fn bind(addr: SocketAddr) -> io::Result<Arc<tokio::net::UdpSocket>> {
             let domain = match addr {
                 SocketAddr::V4(..) => socket2::Domain::IPV4,
@@ -146,12 +119,6 @@ impl UdpTransportFactory for UdpSocketFactory {
             udp_v6.set_fwmark(mark)?;
         }
 
-        #[cfg(target_os = "linux")]
-        let udp_v4 = VectorizedUdpSocket::new(udp_v4);
-
-        #[cfg(target_os = "linux")]
-        let udp_v6 = VectorizedUdpSocket::new(udp_v6);
-
-        Ok((Arc::new(udp_v4), Arc::new(udp_v6)))
+        Ok((udp_v4, udp_v6))
     }
 }
