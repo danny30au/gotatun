@@ -10,19 +10,15 @@ pub mod drop_privileges;
 mod integration_tests;
 pub mod peer;
 
-use async_trait::async_trait;
-use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrIn};
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::IoSliceMut;
-use std::io::{self, IoSlice};
+use std::io::{self};
 use std::iter;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::BitOrAssign;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::io::Interest;
 use tokio::join;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -33,6 +29,7 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
+use crate::udp::{UdpTransport, UdpTransportFactory, UdpTransportFactoryParams};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use peer::{AllowedIP, Peer};
@@ -103,229 +100,6 @@ impl Default for DeviceConfig {
             api: None,
             on_bind: None,
         }
-    }
-}
-
-#[async_trait]
-pub trait UdpTransportFactory: Send + Sync {
-    async fn bind(
-        &mut self,
-        params: &UdpTransportFactoryParams,
-    ) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)>;
-}
-
-pub struct UdpSocketFactory;
-
-pub struct UdpTransportFactoryParams {
-    pub addr_v4: Ipv4Addr,
-    pub addr_v6: Ipv6Addr,
-    pub port: u16,
-
-    #[cfg(target_os = "linux")]
-    pub fwmark: Option<u32>,
-}
-
-#[async_trait]
-impl UdpTransportFactory for UdpSocketFactory {
-    async fn bind(
-        &mut self,
-        params: &UdpTransportFactoryParams,
-    ) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)> {
-        fn bind(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
-            let domain = match addr {
-                SocketAddr::V4(..) => socket2::Domain::IPV4,
-                SocketAddr::V6(..) => socket2::Domain::IPV6,
-            };
-
-            // Construct the socket using `socket2` because we need to set the reuse_address flag.
-            let udp_sock =
-                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-            udp_sock.set_nonblocking(true)?;
-            udp_sock.set_reuse_address(true)?;
-            udp_sock.bind(&addr.into())?;
-
-            tokio::net::UdpSocket::from_std(udp_sock.into())
-        }
-
-        let mut port = params.port;
-        let udp_v4 = bind((params.addr_v4, port).into())?;
-        if port == 0 {
-            // The socket is using a random port, copy it so we can re-use it for IPv6.
-            port = udp_v4.local_addr()?.port();
-        }
-
-        let udp_v6 = bind((params.addr_v6, port).into())?;
-
-        #[cfg(target_os = "linux")]
-        if let Some(mark) = params.fwmark {
-            udp_v4.set_fwmark(mark)?;
-            udp_v6.set_fwmark(mark)?;
-        }
-
-        Ok((Arc::new(udp_v4), Arc::new(udp_v6)))
-    }
-}
-
-#[async_trait]
-pub trait UdpTransport: Send + Sync {
-    async fn send_to(&self, packets: &[u8], target: SocketAddr) -> io::Result<()>;
-    async fn send_many_to(&self, packets: &[(PacketBuf, SocketAddr)]) -> io::Result<()> {
-        for (packet, target) in packets {
-            self.send_to(packet.packet(), *target).await?;
-        }
-        Ok(())
-    }
-
-    fn max_number_of_packets_to_send(&self) -> usize {
-        1
-    }
-
-    fn max_number_of_packets_to_recv(&self) -> usize {
-        1
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
-    //async fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
-    async fn recv_vectored(
-        &self,
-        bufs: &mut [PacketBuf],
-        source_addrs: &mut [Option<SocketAddr>],
-    ) -> io::Result<usize>;
-    fn local_addr(&self) -> io::Result<SocketAddr>;
-    #[cfg(target_os = "linux")]
-    fn set_fwmark(&self, mark: u32) -> io::Result<()>;
-}
-
-#[async_trait]
-impl UdpTransport for tokio::net::UdpSocket {
-    async fn send_to(&self, packet: &[u8], target: SocketAddr) -> io::Result<()> {
-        self.send_to(packet, target).await?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn send_many_to(&self, packets: &[(PacketBuf, SocketAddr)]) -> io::Result<()> {
-        use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrStorage};
-        use std::os::fd::{AsFd, AsRawFd};
-        use tokio::io::Interest;
-
-        //log::info!("send_to_many {}", packets.len());
-
-        let fd = self.as_fd().as_raw_fd();
-
-        let addrs = packets
-            .into_iter()
-            .map(|(_packet, target)| Some(SockaddrStorage::from(*target)))
-            .collect::<Vec<_>>();
-
-        let packets = packets
-            .into_iter()
-            .map(|(packet_buf, _target)| [IoSlice::new(packet_buf.packet())])
-            .collect::<Vec<_>>();
-
-        self.async_io(Interest::WRITABLE, || {
-            let mut multiheaders = MultiHeaders::preallocate(packets.len(), None);
-            nix::sys::socket::sendmmsg(
-                fd,
-                &mut multiheaders,
-                packets.iter(),
-                &addrs,
-                &[],
-                MsgFlags::MSG_DONTWAIT,
-            )?;
-
-            Ok(())
-        })
-        .await?;
-
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn max_number_of_packets_to_send(&self) -> usize {
-        100
-    }
-
-    #[cfg(target_os = "linux")]
-    fn max_number_of_packets_to_recv(&self) -> usize {
-        100
-    }
-
-    /*async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        // TODO: impl mmsg here
-
-        self.recv(buf).await
-    }*/
-
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.recv_from(buf).await
-    }
-
-    /// Returns the number of packets received. 'bufs' and 'source_addrs' receive packets and
-    /// the source of each buf, respectively.
-    ///
-    /// # Arguments
-    /// - `bufs` - A slice of buffers that will receive UDP datagrams.
-    /// - 'source_addrs' - Source addresses to receive. The length must equal that of 'bufs'.
-    async fn recv_vectored(
-        &self,
-        bufs: &mut [PacketBuf],
-        source_addrs: &mut [Option<SocketAddr>],
-    ) -> io::Result<usize> {
-        debug_assert_eq!(bufs.len(), source_addrs.len());
-
-        use std::os::fd::AsRawFd;
-        let fd = self.as_raw_fd();
-
-        let (num_bufs, lens) = self
-            .async_io(Interest::READABLE, || {
-                let n_packets = bufs.len();
-                let mut headers = MultiHeaders::<SockaddrIn>::preallocate(n_packets, None);
-
-                let mut msgs = Vec::with_capacity(n_packets);
-                msgs.extend(
-                    bufs.iter_mut()
-                        .map(|buf| [IoSliceMut::new(&mut buf.buf[..])]),
-                );
-
-                let results = nix::sys::socket::recvmmsg(
-                    fd,
-                    &mut headers,
-                    msgs.iter_mut(),
-                    MsgFlags::MSG_DONTWAIT,
-                    None,
-                )?;
-
-                // FIXME :(
-                let mut lens = Vec::with_capacity(n_packets);
-                for (out_addr, result) in source_addrs.iter_mut().zip(results.into_iter()) {
-                    lens.push(result.bytes);
-                    *out_addr = result.address.map(|addr| addr.into());
-                }
-                let num_bufs = lens.len();
-
-                Ok((num_bufs, lens))
-            })
-            .await?;
-
-        for (buf, len) in bufs.iter_mut().zip(lens) {
-            // FIXME :(
-            buf.packet_len = len;
-        }
-
-        Ok(num_bufs)
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.local_addr()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn set_fwmark(&self, mark: u32) -> io::Result<()> {
-        use nix::sys::socket::{setsockopt, sockopt};
-        setsockopt(&self, sockopt::Mark, &mark)?;
-        Ok(())
     }
 }
 
@@ -722,6 +496,9 @@ impl Device {
         udp4: Arc<dyn UdpTransport>,
         udp6: Arc<dyn UdpTransport>,
     ) {
+        let mut udp4 = udp4.clone_lol();
+        let mut udp6 = udp6.clone_lol();
+
         // TODO: fix rate limiting
         /*
         self.queue.new_periodic_event(
@@ -797,7 +574,7 @@ impl Device {
         let (send_udp_tx, mut send_udp_rx) = mpsc::channel::<(PacketBuf, SocketAddr)>(5000);
         let (send_tun_tx, mut send_tun_rx) = mpsc::channel::<PacketBuf>(5000);
 
-        let udp_send = udp.clone();
+        let mut udp_send = udp.clone_lol();
         let buf_tx_udp = buf_tx.clone();
         let send_task_udp = tokio::task::spawn(async move {
             while let Some((packet_buf, addr)) = send_udp_rx.recv().await {
@@ -814,7 +591,7 @@ impl Device {
         });
 
         let buf_tx_encapsulate = buf_tx.clone();
-        let udp_send_flush = udp.clone(); // TODO: do we need this?
+        let mut udp_send_flush = udp.clone_lol(); // TODO: do we need this?
         let encapsulate_task = tokio::task::spawn(async move {
             while let Some((packet_owned, addr)) = dec_rx.recv().await {
                 let parsed_packet = match rate_limiter.verify_packet(
@@ -1006,6 +783,9 @@ impl Device {
         udp4: Arc<dyn UdpTransport>,
         udp6: Arc<dyn UdpTransport>,
     ) {
+        let mut udp4 = udp4.clone_lol();
+        let mut udp6 = udp6.clone_lol();
+
         let (mtu, tun) = {
             let Some(device) = device.upgrade() else {
                 return;

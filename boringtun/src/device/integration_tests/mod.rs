@@ -5,7 +5,8 @@
 // Those tests require docker and sudo privileges to run
 #[cfg(all(test, not(target_os = "macos"), not(target_os = "windows")))]
 mod tests {
-    use crate::device::{DeviceConfig, DeviceHandle, UdpSocketFactory};
+    use crate::device::{DeviceConfig, DeviceHandle};
+    use crate::udp::UdpSocketFactory;
     use crate::x25519::{PublicKey, StaticSecret};
     use base64::encode as base64encode;
     use hex::encode;
