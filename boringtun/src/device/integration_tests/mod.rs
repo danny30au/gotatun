@@ -61,7 +61,7 @@ mod tests {
 
     /// Represents a single WireGuard interface on local machine
     struct WGHandle {
-        _device: DeviceHandle,
+        _device: DeviceHandle<UdpSocketFactory>,
         name: String,
         addr_v4: IpAddr,
         addr_v6: IpAddr,
