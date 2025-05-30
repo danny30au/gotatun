@@ -15,11 +15,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, IoSlice};
 use std::iter;
+use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrIn};
+use std::io::IoSliceMut;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::BitOrAssign;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use tokio::io::Interest;
 use tokio::join;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -177,8 +180,17 @@ pub trait UdpTransport: Send + Sync {
         1
     }
 
+    fn max_number_of_packets_to_recv(&self) -> usize {
+        1
+    }
+
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
     //async fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    async fn recv_vectored(
+        &self,
+        bufs: &mut [PacketBuf],
+        source_addrs: &mut [Option<SocketAddr>],
+    ) -> io::Result<usize>;
     fn local_addr(&self) -> io::Result<SocketAddr>;
     #[cfg(target_os = "linux")]
     fn set_fwmark(&self, mark: u32) -> io::Result<()>;
@@ -219,7 +231,7 @@ impl UdpTransport for tokio::net::UdpSocket {
                 packets.iter(),
                 &addrs,
                 &[],
-                MsgFlags::empty(),
+                MsgFlags::MSG_DONTWAIT,
             )?;
 
             Ok(())
@@ -234,14 +246,72 @@ impl UdpTransport for tokio::net::UdpSocket {
         100
     }
 
+    #[cfg(target_os = "linux")]
+    fn max_number_of_packets_to_recv(&self) -> usize {
+        100
+    }
+
     /*async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // TODO: impl mmsg here
+
         self.recv(buf).await
     }*/
 
-    // TODO: recvmmsg
-
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.recv_from(buf).await
+    }
+
+    /// Returns the number of packets received. 'bufs' and 'source_addrs' receive packets and
+    /// the source of each buf, respectively.
+    ///
+    /// # Arguments
+    /// - `bufs` - A slice of buffers that will receive UDP datagrams.
+    /// - 'source_addrs' - Source addresses to receive. The length must equal that of 'bufs'.
+    async fn recv_vectored(
+        &self,
+        bufs: &mut [PacketBuf],
+        source_addrs: &mut [Option<SocketAddr>],
+    ) -> io::Result<usize> {
+        debug_assert_eq!(bufs.len(), source_addrs.len());
+
+        use std::os::fd::AsRawFd;
+        let fd = self.as_raw_fd();
+
+        let (num_bufs, lens) = self
+            .async_io(Interest::READABLE, || {
+                let n_packets = bufs.len();
+                let mut headers = MultiHeaders::<SockaddrIn>::preallocate(n_packets, None);
+
+                let mut msgs = Vec::with_capacity(n_packets);
+                msgs.extend(bufs.iter_mut().map(|buf| [IoSliceMut::new(&mut buf.buf[..])]));
+
+                let results = nix::sys::socket::recvmmsg(
+                    fd,
+                    &mut headers,
+                    msgs.iter_mut(),
+                    MsgFlags::MSG_DONTWAIT,
+                    None,
+                )?;
+
+                // FIXME :(
+                let mut lens = Vec::with_capacity(n_packets);
+                for (out_addr, result) in source_addrs.iter_mut().zip(results.into_iter()) {
+                    lens.push(result.bytes);
+                    *out_addr = result.address.map(|addr| addr.into());
+                }
+                let num_bufs = lens.len();
+
+                Ok((num_bufs, lens))
+            })
+            .await?;
+
+        for (buf, len) in bufs.iter_mut().zip(lens) {
+            // FIXME :(
+            buf.packet_len = len;
+        }
+
+        Ok(num_bufs)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -858,44 +928,54 @@ impl Device {
         });
 
         let receive_task = tokio::task::spawn(async move {
+            let mut source_addrs = [None; 100];
             let mut buf_count = 0;
+            let max_number_of_packets = udp.max_number_of_packets_to_recv();
             loop {
-                let mut buf = buf_rx.try_recv().unwrap_or_else(|_| {
+                let mut packet_bufs = vec![];
+                iter::from_fn(|| buf_rx.try_recv().ok())
+                    .take(max_number_of_packets)
+                    .for_each(|buf| packet_bufs.push(PacketBuf {
+                        buf,
+                        packet_len: 0,
+                    }));
+
+                if packet_bufs.is_empty() {
                     buf_count += 1;
                     log::info!("Incoming buffer count: {buf_count}");
-                    datagram_buffer()
-                });
+                    let buf = datagram_buffer();
+                    packet_bufs.push(PacketBuf {
+                        buf,
+                        packet_len: 0,
+                    });
+                }
 
-                // TODO: recvmmsg
-                /*
-                pub fn recvmmsg<'a, XS, S, I>(
-                    fd: RawFd,
-                    data: &'a mut MultiHeaders<S>,
-                    slices: XS,
-                    flags: MsgFlags,
-                    timeout: Option<TimeSpec>,
-                ) -> Result<MultiResults<'a, S>>
-                where
-                    XS: IntoIterator<Item = &'a mut I>,
-                    I: AsMut<[IoSliceMut<'a>]> + 'a,*/
-
-                //nix::sys::socket::recvmmsg(fd, data, flags, timeout)
+                let n_available_bufs = packet_bufs.len();
 
                 // Read packets from the socket.
-                let (packet_len, addr) = udp.recv_from(&mut buf[..]).await.map_err(|e| {
-                    log::error!("UDP recv_from error {e:?}");
-                    Error::IoError(e)
-                })?;
+                // TODO: src in PacketBuf?
+                let num_packets = udp
+                    .recv_vectored(&mut packet_bufs, &mut source_addrs[..n_available_bufs])
+                    .await
+                    .map_err(|e| {
+                        log::error!("UDP recv_from error {e:?}");
+                        Error::IoError(e)
+                    })?;
 
-                let packet_buf = PacketBuf { packet_len, buf };
+                for (packet_buf, src) in packet_bufs.into_iter().take(num_packets).zip(source_addrs.iter()) {
+                    let Some(src) = src else {
+                        log::error!("recv_vectored returned packet with no src; ignoring");
+                        continue;
+                    };
 
-                // TODO: handle closed
-                if let Err(mpsc::error::TrySendError::Full((packet_buf, addr))) =
-                    dec_tx.try_send((packet_buf, addr))
-                {
-                    log::warn!("Back-pressure on dec_tx incoming"); // TODO: remove this log
-                    if dec_tx.send((packet_buf, addr)).await.is_err() {
-                        return Ok::<(), Error>(()); // Decryption task has been dropped
+                    // TODO: handle closed
+                    if let Err(mpsc::error::TrySendError::Full((packet_buf, addr))) =
+                        dec_tx.try_send((packet_buf, *src))
+                    {
+                        log::warn!("Back-pressure on dec_tx incoming"); // TODO: remove this log
+                        if dec_tx.send((packet_buf, addr)).await.is_err() {
+                            return Ok::<(), Error>(()); // Decryption task has been dropped
+                        }
                     }
                 }
             }
