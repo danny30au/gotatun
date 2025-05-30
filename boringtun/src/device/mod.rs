@@ -11,12 +11,12 @@ mod integration_tests;
 pub mod peer;
 
 use async_trait::async_trait;
+use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrIn};
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::IoSliceMut;
 use std::io::{self, IoSlice};
 use std::iter;
-use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrIn};
-use std::io::IoSliceMut;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::BitOrAssign;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -284,7 +284,10 @@ impl UdpTransport for tokio::net::UdpSocket {
                 let mut headers = MultiHeaders::<SockaddrIn>::preallocate(n_packets, None);
 
                 let mut msgs = Vec::with_capacity(n_packets);
-                msgs.extend(bufs.iter_mut().map(|buf| [IoSliceMut::new(&mut buf.buf[..])]));
+                msgs.extend(
+                    bufs.iter_mut()
+                        .map(|buf| [IoSliceMut::new(&mut buf.buf[..])]),
+                );
 
                 let results = nix::sys::socket::recvmmsg(
                     fd,
@@ -930,27 +933,23 @@ impl Device {
         let receive_task = tokio::task::spawn(async move {
             let mut source_addrs = [None; 100];
             let mut buf_count = 0;
+            let mut packet_bufs = vec![];
             let max_number_of_packets = udp.max_number_of_packets_to_recv();
             loop {
-                let mut packet_bufs = vec![];
                 iter::from_fn(|| buf_rx.try_recv().ok())
-                    .take(max_number_of_packets)
-                    .for_each(|buf| packet_bufs.push(PacketBuf {
-                        buf,
-                        packet_len: 0,
-                    }));
+                    .take(max_number_of_packets.saturating_sub(packet_bufs.len()))
+                    .for_each(|buf| packet_bufs.push(PacketBuf { buf, packet_len: 0 }));
 
-                if packet_bufs.is_empty() {
+                while packet_bufs.len() < 1 {
                     buf_count += 1;
                     log::info!("Incoming buffer count: {buf_count}");
                     let buf = datagram_buffer();
-                    packet_bufs.push(PacketBuf {
-                        buf,
-                        packet_len: 0,
-                    });
+                    packet_bufs.push(PacketBuf { buf, packet_len: 0 });
                 }
 
                 let n_available_bufs = packet_bufs.len();
+
+                //log::info!("n_available_bufs: {n_available_bufs}");
 
                 // Read packets from the socket.
                 // TODO: src in PacketBuf?
@@ -962,7 +961,14 @@ impl Device {
                         Error::IoError(e)
                     })?;
 
-                for (packet_buf, src) in packet_bufs.into_iter().take(num_packets).zip(source_addrs.iter()) {
+                // TODO: no alloc
+                let new_bufs = packet_bufs.split_off(num_packets);
+
+                for (packet_buf, src) in packet_bufs
+                    .into_iter()
+                    .take(num_packets)
+                    .zip(source_addrs.iter())
+                {
                     let Some(src) = src else {
                         log::error!("recv_vectored returned packet with no src; ignoring");
                         continue;
@@ -978,6 +984,8 @@ impl Device {
                         }
                     }
                 }
+
+                packet_bufs = new_bufs;
             }
         });
 
