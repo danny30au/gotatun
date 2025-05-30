@@ -59,7 +59,7 @@ impl UdpTransport for tokio::net::UdpSocket {
                 packets,
                 &buf.targets[..],
                 &[],
-                MsgFlags::empty(),
+                MsgFlags::MSG_DONTWAIT,
             )?;
 
             Ok(())
