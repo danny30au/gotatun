@@ -708,44 +708,41 @@ impl Device {
         });
 
         let receive_task = tokio::task::spawn(async move {
-            let mut source_addrs = [None; 100];
             let mut buf_count = 0;
-            let mut packet_bufs = vec![];
             let max_number_of_packets = udp.max_number_of_packets_to_recv();
+            let mut packet_bufs = Vec::with_capacity(2 * max_number_of_packets);
+            let mut source_addrs = vec![None; max_number_of_packets];
+
             loop {
                 iter::from_fn(|| buf_rx.try_recv().ok())
-                    .take(max_number_of_packets.saturating_sub(packet_bufs.len()))
+                    .take((2 * max_number_of_packets).saturating_sub(packet_bufs.len()))
                     .for_each(|buf| packet_bufs.push(PacketBuf { buf, packet_len: 0 }));
 
-                while packet_bufs.len() < max_number_of_packets {
+                while packet_bufs.len() < 2 * max_number_of_packets {
                     buf_count += 1;
                     log::info!("Incoming buffer count: {buf_count}");
                     let buf = datagram_buffer();
                     packet_bufs.push(PacketBuf { buf, packet_len: 0 });
                 }
 
-                let n_available_bufs = packet_bufs.len();
+                let n_available_bufs = packet_bufs.len().min(max_number_of_packets);
 
                 //log::info!("n_available_bufs: {n_available_bufs}");
 
                 // Read packets from the socket.
                 // TODO: src in PacketBuf?
                 let num_packets = udp
-                    .recv_vectored(&mut packet_bufs, &mut source_addrs[..n_available_bufs])
+                    .recv_vectored(&mut packet_bufs[..n_available_bufs], &mut source_addrs[..n_available_bufs])
                     .await
                     .map_err(|e| {
                         log::error!("UDP recv_from error {e:?}");
                         Error::IoError(e)
                     })?;
 
-                // TODO: no alloc
-                let new_bufs = packet_bufs.split_off(num_packets);
+                for i in 0..num_packets {
+                    let packet_buf = packet_bufs.swap_remove(i);
+                    let src = source_addrs[i];
 
-                for (packet_buf, src) in packet_bufs
-                    .into_iter()
-                    .take(num_packets)
-                    .zip(source_addrs.iter())
-                {
                     let Some(src) = src else {
                         log::error!("recv_vectored returned packet with no src; ignoring");
                         continue;
@@ -753,7 +750,7 @@ impl Device {
 
                     // TODO: handle closed
                     if let Err(mpsc::error::TrySendError::Full((packet_buf, addr))) =
-                        dec_tx.try_send((packet_buf, *src))
+                        dec_tx.try_send((packet_buf, src))
                     {
                         log::warn!("Back-pressure on dec_tx incoming"); // TODO: remove this log
                         if dec_tx.send((packet_buf, addr)).await.is_err() {
@@ -761,8 +758,6 @@ impl Device {
                         }
                     }
                 }
-
-                packet_bufs = new_bufs;
             }
         });
 
