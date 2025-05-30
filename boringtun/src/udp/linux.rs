@@ -73,6 +73,10 @@ impl UdpTransport for tokio::net::UdpSocket {
         MAX_PACKET_COUNT
     }
 
+    fn max_number_of_packets_to_recv(&self) -> usize {
+        MAX_PACKET_COUNT
+    }
+
     async fn send_to(&self, packet: &[u8], target: SocketAddr) -> io::Result<()> {
         self.send_to(packet, target).await?;
         Ok(())
