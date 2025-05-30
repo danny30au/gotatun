@@ -49,12 +49,15 @@ eyre = "*" # TODO
 log = "*" # TODO
 typed-builder = "0.20.0"
 tun = { version = "0.7.13", features = ["async"] }
+async-trait = "0.1.88"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.25", default-features = false, features = [
     "time",
     "user",
-	"socket",
+    "socket",
+    "uio",
+    "net",
 ] }
 
 [dev-dependencies]

@@ -7,7 +7,7 @@
 #[cfg(unix)]
 mod unix {
     use boringtun::device::drop_privileges::drop_privileges;
-    use boringtun::device::{DeviceConfig, DeviceHandle};
+    use boringtun::device::{DeviceConfig, DeviceHandle, UdpSocketFactory};
     use clap::{Arg, Command};
     use daemonize::Daemonize;
     use std::fs::File;
@@ -142,7 +142,7 @@ mod unix {
             on_bind: None,
         };
 
-        let _device_handle: DeviceHandle = match DeviceHandle::from_tun_name(tun_name, config).await
+        let _device_handle: DeviceHandle = match DeviceHandle::from_tun_name(UdpSocketFactory, tun_name, config).await
         {
             Ok(d) => d,
             Err(e) => {

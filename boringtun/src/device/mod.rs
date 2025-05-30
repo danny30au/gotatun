@@ -18,6 +18,7 @@ use std::ops::BitOrAssign;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use async_trait::async_trait;
 use tokio::join;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -101,6 +102,102 @@ impl Default for DeviceConfig {
     }
 }
 
+#[async_trait]
+pub trait UdpTransportFactory: Send + Sync {
+    async fn bind(&mut self, params: &UdpTransportFactoryParams) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)>;
+}
+
+pub struct UdpSocketFactory;
+
+pub struct UdpTransportFactoryParams {
+    pub addr_v4: Ipv4Addr,
+    pub addr_v6: Ipv6Addr,
+    pub port: u16,
+
+    #[cfg(target_os = "linux")]
+    pub fwmark: Option<u32>,
+}
+
+#[async_trait]
+impl UdpTransportFactory for UdpSocketFactory {
+    async fn bind(&mut self, params: &UdpTransportFactoryParams,
+    ) -> io::Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>)> {
+        fn bind(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+            let domain = match addr {
+                SocketAddr::V4(..) => socket2::Domain::IPV4,
+                SocketAddr::V6(..) => socket2::Domain::IPV6,
+            };
+
+            // Construct the socket using `socket2` because we need to set the reuse_address flag.
+            let udp_sock =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            udp_sock.set_nonblocking(true)?;
+            udp_sock.set_reuse_address(true)?;
+            udp_sock.bind(&addr.into())?;
+
+            tokio::net::UdpSocket::from_std(udp_sock.into())
+        }
+
+        let mut port = params.port;
+        let udp_v4 = bind((params.addr_v4, port).into())?;
+        if port == 0 {
+            // The socket is using a random port, copy it so we can re-use it for IPv6.
+            port = udp_v4.local_addr()?.port();
+        }
+
+        let udp_v6 = bind((params.addr_v6, port).into())?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(mark) = params.fwmark {
+            udp_v4.set_fwmark(mark)?;
+            udp_v6.set_fwmark(mark)?;
+        }
+
+        Ok((Arc::new(udp_v4), Arc::new(udp_v6)))
+    }
+}
+
+#[async_trait]
+pub trait UdpTransport: Send + Sync {
+    async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<usize>;
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    #[cfg(target_os = "linux")]
+    fn set_fwmark(&self, mark: u32) -> io::Result<()>;
+}
+
+#[async_trait]
+impl UdpTransport for tokio::net::UdpSocket {
+    async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.send_to(data, target).await
+
+        // TODO:
+        //nix::sys::socket::sendmmsg();
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv(buf).await
+    }
+
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf).await
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.local_addr()
+    }
+    
+    #[cfg(target_os = "linux")]
+    fn set_fwmark(&self, mark: u32) -> io::Result<()> {
+        use nix::sys::socket::{setsockopt, sockopt};
+        use std::os::fd::AsRawFd;
+        setsockopt(self.as_raw_fd(), sockopt::Mark, &mark)?;
+        Ok(())
+    }
+}
+
 pub struct Device {
     key_pair: Option<(x25519::StaticSecret, x25519::PublicKey)>,
     fwmark: Option<u32>,
@@ -119,6 +216,7 @@ pub struct Device {
     rate_limiter: Option<Arc<RateLimiter>>,
 
     port: u16,
+    udp_factory: Box<dyn UdpTransportFactory>,
     connection: Option<Connection>,
 
     /// The task that responds to API requests.
@@ -133,8 +231,8 @@ struct Task {
     handle: Option<JoinHandle<()>>,
 }
 pub(crate) struct Connection {
-    udp4: Arc<tokio::net::UdpSocket>,
-    udp6: Arc<tokio::net::UdpSocket>,
+    udp4: Arc<dyn UdpTransport>,
+    udp6: Arc<dyn UdpTransport>,
     listen_port: u16,
 
     /// The task that reads IPv4 traffic from the UDP socket.
@@ -155,9 +253,6 @@ impl Connection {
         let mut device_guard = device.write().await;
         let (udp4, udp6) = device_guard.open_listen_socket().await?;
         drop(device_guard);
-
-        let udp4 = Arc::new(udp4);
-        let udp6 = Arc::new(udp6);
 
         let outgoing = Task::spawn(
             "handle_outgoing",
@@ -189,13 +284,14 @@ impl Connection {
 }
 
 impl DeviceHandle {
-    pub async fn new(tun: AsyncDevice, config: DeviceConfig) -> Result<DeviceHandle, Error> {
+    pub async fn new(udp_factory: impl UdpTransportFactory + 'static, device: AsyncDevice, config: DeviceConfig) -> Result<DeviceHandle, Error> {
         Ok(DeviceHandle {
-            device: Device::new(tun, config).await?,
+            device: Device::new(udp_factory, device, config).await?,
         })
     }
 
     pub async fn from_tun_name(
+        udp_factory: impl UdpTransportFactory + 'static,
         tun_name: &str,
         config: DeviceConfig,
     ) -> Result<DeviceHandle, Error> {
@@ -206,7 +302,7 @@ impl DeviceHandle {
             p.enable_routing(false);
         });
         let tun = tun::create_as_async(&tun_config)?;
-        DeviceHandle::new(tun, config).await
+        DeviceHandle::new(udp_factory, tun, config).await
     }
 
     pub async fn stop(self) {
@@ -345,6 +441,7 @@ impl Device {
     }
 
     pub async fn new(
+        udp_factory: impl UdpTransportFactory + 'static,
         tun: tun::AsyncDevice,
         config: DeviceConfig,
     ) -> Result<Arc<RwLock<Device>>, Error> {
@@ -358,6 +455,7 @@ impl Device {
 
         let device = Device {
             api: None,
+            udp_factory: Box::new(udp_factory),
             tun: Arc::new(tun),
             fwmark: Default::default(),
             key_pair: Default::default(),
@@ -411,49 +509,23 @@ impl Device {
     /// Bind two UDP sockets. One for IPv4, one for IPv6.
     async fn open_listen_socket(
         &mut self,
-    ) -> Result<(tokio::net::UdpSocket, tokio::net::UdpSocket), Error> {
-        // Construct the socket using `socket2` because we need to set the reuse_address flag.
-        let bind_socket = |addr: SocketAddr| -> Result<_, Error> {
-            let domain = match addr {
-                SocketAddr::V4(..) => socket2::Domain::IPV4,
-                SocketAddr::V6(..) => socket2::Domain::IPV6,
-            };
-            let udp_sock4 =
-                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-            udp_sock4.set_nonblocking(true)?;
-            udp_sock4.set_reuse_address(true)?;
-            udp_sock4
-                .bind(&addr.into())
-                .map_err(|e| Error::Bind(e, format!("Failed to bind UDP socket to {addr}")))?;
-            let udp_sock4 = tokio::net::UdpSocket::from_std(udp_sock4.into())?;
-
-            Ok(udp_sock4)
+    ) -> Result<(Arc<dyn UdpTransport>, Arc<dyn UdpTransport>), Error> {
+        let params = UdpTransportFactoryParams {
+            addr_v4: Ipv4Addr::UNSPECIFIED,
+            addr_v6: Ipv6Addr::UNSPECIFIED,
+            port: self.port,
+            #[cfg(target_os = "linux")]
+            fwmark: self.fwmark,
         };
+        let (udp_sock4, udp_sock6) = self.udp_factory.bind(&params).await?;
 
-        let mut port = self.port;
-        let addrv4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-        let udp_sock4 = bind_socket(addrv4.into())?;
-        if port == 0 {
-            // The socket is using a random port, copy it so we can re-use it for IPv6.
-            port = udp_sock4.local_addr()?.port();
-        }
-
-        let addrv6 = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0);
-        let udp_sock6 = bind_socket(addrv6.into())?;
-
-        #[cfg(target_os = "linux")]
-        if let Some(mark) = self.fwmark {
-            use nix::sys::socket::{setsockopt, sockopt};
-            use std::os::fd::AsRawFd;
-            // TODO: errors
-            setsockopt(udp_sock4.as_raw_fd(), sockopt::Mark, &mark).unwrap();
-            setsockopt(udp_sock6.as_raw_fd(), sockopt::Mark, &mark).unwrap();
-        }
-
+        // FIXME: this should be handled by the impl UdpTransportFactory
+        /*
         if let Some(bypass) = &mut self.on_bind {
             bypass(&udp_sock4);
             bypass(&udp_sock6);
         }
+        */
 
         Ok((udp_sock4, udp_sock6))
     }
@@ -486,15 +558,13 @@ impl Device {
 
     #[cfg(any(target_os = "fuchsia", target_os = "linux"))]
     fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
-        use nix::sys::socket::{setsockopt, sockopt};
-        use std::os::fd::AsRawFd;
 
         self.fwmark = Some(mark);
 
         if let Some(conn) = &mut self.connection {
             // TODO: errors
-            setsockopt(conn.udp4.as_raw_fd(), sockopt::Mark, &mark).unwrap();
-            setsockopt(conn.udp6.as_raw_fd(), sockopt::Mark, &mark).unwrap();
+            conn.udp4.set_fwmark(mark).unwrap();
+            conn.udp6.set_fwmark(mark).unwrap();
         }
 
         // // Then on all currently connected sockets
@@ -513,7 +583,7 @@ impl Device {
         self.peers_by_ip.clear();
     }
 
-    async fn handle_timers(device: Weak<RwLock<Self>>, udp4: Arc<UdpSocket>, udp6: Arc<UdpSocket>) {
+    async fn handle_timers(device: Weak<RwLock<Self>>, udp4: Arc<dyn UdpTransport>, udp6: Arc<dyn UdpTransport>) {
         // TODO: fix rate limiting
         /*
         self.queue.new_periodic_event(
@@ -565,7 +635,7 @@ impl Device {
     }
 
     /// Read from UDP socket, decapsulate, write to tunnel device
-    async fn handle_incoming(device: Weak<RwLock<Self>>, udp: Arc<UdpSocket>) -> Result<(), Error> {
+    async fn handle_incoming(device: Weak<RwLock<Self>>, udp: Arc<dyn UdpTransport>) -> Result<(), Error> {
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
         let (buf_tx, mut buf_rx) = mpsc::unbounded_channel::<Box<[u8; 4096]>>();
@@ -590,7 +660,7 @@ impl Device {
         let buf_tx_udp = buf_tx.clone();
         let send_task_udp = tokio::task::spawn(async move {
             while let Some((packet_buf, addr)) = send_udp_rx.recv().await {
-                let _: Result<_, _> = udp_send.send_to(packet_buf.packet(), &addr).await;
+                let _: Result<_, _> = udp_send.send_to(packet_buf.packet(), addr).await;
                 let _ = buf_tx_udp.send(packet_buf.buf);
             }
         });
@@ -705,7 +775,7 @@ impl Device {
                         match peer.tunnel.decapsulate(None, &[], &mut dst_buf[..]) {
                             TunnResult::WriteToNetwork(packet) => {
                                 // TODO: why do we ignore this error?
-                                let _ = udp_send_flush.send_to(packet, &addr).await;
+                                let _ = udp_send_flush.send_to(packet, addr).await;
                             }
                             TunnResult::Done => break,
                             // TODO: why do we ignore this error?
@@ -761,8 +831,8 @@ impl Device {
     /// Read from tunnel device, encapsulate, and write to UDP socket for the corresponding peer
     async fn handle_outgoing(
         device: Weak<RwLock<Self>>,
-        udp4: Arc<UdpSocket>,
-        udp6: Arc<UdpSocket>,
+        udp4: Arc<dyn UdpTransport>,
+        udp6: Arc<dyn UdpTransport>,
     ) {
         let (mtu, tun) = {
             let Some(device) = device.upgrade() else {
@@ -868,14 +938,14 @@ impl Device {
         let buf_tx_v4 = buf_tx.clone();
         let send_task_v4 = tokio::task::spawn(async move {
             while let Some((packet_buf, addr)) = packet_v4_rx.recv().await {
-                let _: Result<_, _> = udp4.send_to(packet_buf.packet(), addr).await;
+                let _: Result<_, _> = udp4.send_to(packet_buf.packet(), addr.into()).await;
                 let _ = buf_tx_v4.send(packet_buf.buf);
             }
         });
         let buf_tx_v6 = buf_tx.clone();
         let send_task_v6 = tokio::task::spawn(async move {
             while let Some((packet_buf, addr)) = packet_v6_rx.recv().await {
-                let _: Result<_, _> = udp6.send_to(packet_buf.packet(), addr).await;
+                let _: Result<_, _> = udp6.send_to(packet_buf.packet(), addr.into()).await;
                 let _ = buf_tx_v6.send(packet_buf.buf);
             }
         });
