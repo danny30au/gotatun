@@ -25,6 +25,7 @@ use tokio::sync::RwLock;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::buffer::{BufferPool, PacketBuf};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -39,6 +40,7 @@ use tun::{AbstractDevice, AsyncDevice};
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
+const BUFFER_POOL_ALLOC: usize = MAX_UDP_SIZE * 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -553,8 +555,6 @@ impl<UF: UdpTransportFactory> Device<UF> {
     ) -> Result<(), Error> {
         let mut dst_buf = [0u8; MAX_UDP_SIZE];
 
-        let (buf_tx, mut buf_rx) = mpsc::unbounded_channel::<Box<[u8; 4096]>>();
-
         let (tun, private_key, public_key, rate_limiter) = {
             let Some(device) = device.upgrade() else {
                 return Ok(());
@@ -572,24 +572,20 @@ impl<UF: UdpTransportFactory> Device<UF> {
         let (send_tun_tx, mut send_tun_rx) = mpsc::channel::<PacketBuf>(5000);
 
         let udp_send = udp.clone();
-        let buf_tx_udp = buf_tx.clone();
         let send_task_udp = tokio::task::spawn(async move {
             while let Some((packet_buf, addr)) = send_udp_rx.recv().await {
-                let _: Result<_, _> = udp_send.send_to(packet_buf.packet(), addr).await;
-                let _ = buf_tx_udp.send(packet_buf.buf);
+                let _ = udp_send.send_to(packet_buf.packet(), addr).await;
             }
         });
-        let buf_tx_tun = buf_tx.clone();
         let send_task_tun = tokio::task::spawn(async move {
             while let Some(packet_buf) = send_tun_rx.recv().await {
-                let _: Result<_, _> = tun.send(packet_buf.packet()).await;
-                let _ = buf_tx_tun.send(packet_buf.buf);
+                let _ = tun.send(packet_buf.packet()).await;
             }
         });
 
-        let buf_tx_encapsulate = buf_tx.clone();
         let udp_send_flush = udp.clone(); // TODO: do we need this?
         let encapsulate_task = tokio::task::spawn(async move {
+            let mut buffer_pool = BufferPool::new(BUFFER_POOL_ALLOC);
             while let Some((packet_owned, addr)) = dec_rx.recv().await {
                 let parsed_packet = match rate_limiter.verify_packet(
                     Some(addr.ip()),
@@ -598,10 +594,7 @@ impl<UF: UdpTransportFactory> Device<UF> {
                 ) {
                     Ok(packet) => packet,
                     Err(TunnResult::WriteToNetwork(cookie)) => {
-                        let mut packet_owned = packet_owned;
-                        // TODO: make less panicky
-                        packet_owned.buf[..cookie.len()].copy_from_slice(cookie);
-                        packet_owned.packet_len = cookie.len();
+                        let packet_owned = buffer_pool.copy(cookie);
                         send_udp_tx
                             .send((packet_owned, addr))
                             .await
@@ -609,7 +602,6 @@ impl<UF: UdpTransportFactory> Device<UF> {
                         continue;
                     }
                     Err(_) => {
-                        let _ = buf_tx_encapsulate.send(packet_owned.buf);
                         continue;
                     }
                 };
@@ -628,31 +620,27 @@ impl<UF: UdpTransportFactory> Device<UF> {
                     Packet::PacketCookieReply(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
                     Packet::PacketData(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
                 };
-                let Some(peer) = peer else {
-                    let _ = buf_tx_encapsulate.send(packet_owned.buf);
-                    continue;
-                };
+                let Some(peer) = peer else { continue };
                 let mut peer = peer.lock().await;
                 let mut flush = false;
                 match peer
                     .tunnel
                     .handle_verified_packet(parsed_packet, &mut dst_buf[..])
                 {
-                    TunnResult::Done => {
-                        // Send the buffer back to be reclaimed
-                        let _ = buf_tx_encapsulate.send(packet_owned.buf);
-                    }
+                    TunnResult::Done => {}
                     TunnResult::Err(_) => {
                         // TODO: handle or log error?
-                        let _ = buf_tx_encapsulate.send(packet_owned.buf);
                         continue;
                     }
                     TunnResult::WriteToNetwork(packet) => {
                         flush = true;
                         let mut packet_owned = packet_owned;
-                        // TODO: make less panicky
-                        packet_owned.buf[..packet.len()].copy_from_slice(packet);
-                        packet_owned.packet_len = packet.len();
+                        packet_owned.packet.clear();
+                        if packet_owned.packet.try_reclaim(packet.len()) {
+                            packet_owned.packet.extend_from_slice(packet);
+                        } else {
+                            buffer_pool.copy(packet);
+                        }
                         send_udp_tx
                             .send((packet_owned, addr))
                             .await
@@ -661,9 +649,12 @@ impl<UF: UdpTransportFactory> Device<UF> {
                     TunnResult::WriteToTunnelV4(packet, addr) => {
                         if peer.is_allowed_ip(addr) {
                             let mut packet_owned = packet_owned;
-                            // TODO: make less panicky
-                            packet_owned.buf[..packet.len()].copy_from_slice(packet);
-                            packet_owned.packet_len = packet.len();
+                            packet_owned.packet.clear();
+                            if packet_owned.packet.try_reclaim(packet.len()) {
+                                packet_owned.packet.extend_from_slice(packet);
+                            } else {
+                                buffer_pool.copy(packet);
+                            }
                             send_tun_tx
                                 .send(packet_owned)
                                 .await
@@ -673,9 +664,12 @@ impl<UF: UdpTransportFactory> Device<UF> {
                     TunnResult::WriteToTunnelV6(packet, addr) => {
                         if peer.is_allowed_ip(addr) {
                             let mut packet_owned = packet_owned;
-                            // TODO: make less panicky
-                            packet_owned.buf[..packet.len()].copy_from_slice(packet);
-                            packet_owned.packet_len = packet.len();
+                            packet_owned.packet.clear();
+                            if packet_owned.packet.try_reclaim(packet.len()) {
+                                packet_owned.packet.extend_from_slice(packet);
+                            } else {
+                                buffer_pool.copy(packet);
+                            }
                             send_tun_tx
                                 .send(packet_owned)
                                 .await
@@ -705,21 +699,14 @@ impl<UF: UdpTransportFactory> Device<UF> {
         });
 
         let receive_task = tokio::task::spawn(async move {
-            let mut buf_count = 0;
+            let mut buffer_pool = BufferPool::new(BUFFER_POOL_ALLOC);
             let max_number_of_packets = udp.max_number_of_packets_to_recv();
             let mut packet_bufs = Vec::with_capacity(2 * max_number_of_packets);
             let mut source_addrs = vec![None; max_number_of_packets];
 
             loop {
-                iter::from_fn(|| buf_rx.try_recv().ok())
-                    .take((2 * max_number_of_packets).saturating_sub(packet_bufs.len()))
-                    .for_each(|buf| packet_bufs.push(PacketBuf { buf, packet_len: 0 }));
-
                 while packet_bufs.len() < 2 * max_number_of_packets {
-                    buf_count += 1;
-                    log::info!("Incoming buffer count: {buf_count}");
-                    let buf = datagram_buffer();
-                    packet_bufs.push(PacketBuf { buf, packet_len: 0 });
+                    packet_bufs.push(buffer_pool.take(4096));
                 }
 
                 let n_available_bufs = packet_bufs.len().min(max_number_of_packets);
@@ -795,20 +782,14 @@ impl<UF: UdpTransportFactory> Device<UF> {
 
         // let mut src_buf = [0u8; MAX_UDP_SIZE];
 
-        let (buf_tx, mut buf_rx) = mpsc::unbounded_channel::<Box<[u8; 4096]>>();
         let (dec_tx, mut dec_rx) = mpsc::channel::<PacketBuf>(5000);
         let (packet_v4_tx, mut packet_v4_rx) = mpsc::channel::<(PacketBuf, SocketAddrV4)>(5000);
         let (packet_v6_tx, mut packet_v6_rx) = mpsc::channel::<(PacketBuf, SocketAddrV6)>(5000);
 
         let receive_task = tokio::task::spawn(async move {
-            let mut buf_count = 0;
+            let mut buffer_pool = BufferPool::new(BUFFER_POOL_ALLOC);
             loop {
-                let mut src_buf = buf_rx.try_recv().unwrap_or_else(|_| {
-                    buf_count += 1;
-                    log::info!("Outgoing buffer count: {buf_count}");
-                    datagram_buffer()
-                });
-
+                let src_buf = buffer_pool.borrow_mut(mtu);
                 let n = match tun.recv(&mut src_buf[..mtu]).await {
                     Ok(src) => src,
                     Err(e) => {
@@ -816,10 +797,7 @@ impl<UF: UdpTransportFactory> Device<UF> {
                         continue;
                     }
                 };
-                let packet_buf = PacketBuf {
-                    packet_len: n,
-                    buf: src_buf,
-                };
+                let packet_buf = buffer_pool.take(n);
 
                 // TODO: handle closed
                 if let Err(mpsc::error::TrySendError::Full(packet_buf)) =
@@ -834,6 +812,7 @@ impl<UF: UdpTransportFactory> Device<UF> {
         });
 
         let encapsulate_task = tokio::task::spawn(async move {
+            let mut buffer_pool = BufferPool::new(BUFFER_POOL_ALLOC);
             let mut dst_buf = vec![0u8; MAX_UDP_SIZE].into_boxed_slice();
             while let Some(packet_buf) = dec_rx.recv().await {
                 let dst_addr = match Tunn::dst_address(packet_buf.packet()) {
@@ -856,10 +835,7 @@ impl<UF: UdpTransportFactory> Device<UF> {
                         log::error!("Encapsulate error={e:?}: {e:?}");
                     }
                     TunnResult::WriteToNetwork(packet) => {
-                        let mut packet_buf = packet_buf;
-                        // TODO: make less panicky
-                        packet_buf.buf[..packet.len()].copy_from_slice(packet);
-                        packet_buf.packet_len = packet.len();
+                        let packet_buf = buffer_pool.copy(packet);
 
                         let endpoint_addr = peer.endpoint().addr;
                         if let Some(SocketAddr::V4(addr)) = endpoint_addr {
@@ -879,7 +855,6 @@ impl<UF: UdpTransportFactory> Device<UF> {
             }
         });
 
-        let buf_tx_v4 = buf_tx.clone();
         let send_task_v4 = tokio::task::spawn(async move {
             let mut buf = vec![];
             let max_number_of_packets_to_send = udp4.max_number_of_packets_to_send();
@@ -890,7 +865,6 @@ impl<UF: UdpTransportFactory> Device<UF> {
 
                 if packet_v4_rx.is_empty() {
                     let _ = udp4.send_to(packet_buf.packet(), addr.into()).await;
-                    let _ = buf_tx_v4.send(packet_buf.buf);
                 } else {
                     // collect as many packets as possible into a buffer
                     [(packet_buf, addr)]
@@ -904,18 +878,12 @@ impl<UF: UdpTransportFactory> Device<UF> {
                         .send_many_to(&mut send_many_buf, &buf)
                         .await
                         .inspect_err(|e| log::warn!("send_to_many_err: {e:#}"));
-
-                    for (packet_buf, _) in buf.drain(..) {
-                        let _ = buf_tx_v4.send(packet_buf.buf);
-                    }
                 }
             }
         });
-        let buf_tx_v6 = buf_tx.clone();
         let send_task_v6 = tokio::task::spawn(async move {
             while let Some((packet_buf, addr)) = packet_v6_rx.recv().await {
-                let _: Result<_, _> = udp6.send_to(packet_buf.packet(), addr.into()).await;
-                let _ = buf_tx_v6.send(packet_buf.buf);
+                let _ = udp6.send_to(packet_buf.packet(), addr.into()).await;
             }
         });
 
@@ -950,17 +918,6 @@ struct IndexLfsr {
 #[inline(never)]
 pub fn datagram_buffer() -> Box<[u8; 4096]> {
     Box::new([0u8; 4096])
-}
-
-pub struct PacketBuf {
-    pub packet_len: usize,
-    pub buf: Box<[u8; 4096]>,
-}
-
-impl PacketBuf {
-    pub fn packet(&self) -> &[u8] {
-        &self.buf[..self.packet_len]
-    }
 }
 
 impl IndexLfsr {

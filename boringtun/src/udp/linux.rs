@@ -7,7 +7,7 @@ use std::{
 };
 use tokio::io::Interest;
 
-use crate::device::PacketBuf;
+use crate::buffer::PacketBuf;
 
 use super::UdpTransport;
 
@@ -104,7 +104,7 @@ impl UdpTransport for tokio::net::UdpSocket {
                 let mut msgs = Vec::with_capacity(n_packets);
                 msgs.extend(
                     bufs.iter_mut()
-                        .map(|buf| [IoSliceMut::new(&mut buf.buf[..])]),
+                        .map(|buf| [IoSliceMut::new(&mut buf.packet[..])]),
                 );
 
                 let results = nix::sys::socket::recvmmsg(
@@ -129,7 +129,7 @@ impl UdpTransport for tokio::net::UdpSocket {
 
         for (buf, len) in bufs.iter_mut().zip(lens) {
             // FIXME :(
-            buf.packet_len = len;
+            buf.packet.truncate(len);
         }
 
         Ok(num_bufs)

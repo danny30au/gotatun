@@ -8,6 +8,7 @@
 #[cfg(feature = "device")]
 pub mod device;
 
+pub mod buffer;
 pub mod udp;
 
 #[cfg(feature = "ffi-bindings")]

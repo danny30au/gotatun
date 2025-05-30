@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 
-use crate::device::PacketBuf;
+use crate::buffer::PacketBuf;
 
 #[cfg(target_os = "linux")]
 mod linux;
