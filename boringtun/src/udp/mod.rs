@@ -72,7 +72,7 @@ impl UdpTransport for Arc<tokio::net::UdpSocket> {
     }
 
     async fn send_to(&mut self, packet: &[u8], target: SocketAddr) -> io::Result<()> {
-        self.send_to(packet, target).await?;
+        tokio::net::UdpSocket::send_to(self, packet, target).await?;
         Ok(())
     }
 
@@ -82,7 +82,7 @@ impl UdpTransport for Arc<tokio::net::UdpSocket> {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.recv_from(buf).await
+        tokio::net::UdpSocket::recv_from(self, buf).await
     }
 
     /// Returns the number of packets received. 'bufs' and 'source_addrs' receive packets and
