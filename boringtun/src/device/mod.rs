@@ -940,7 +940,7 @@ impl Device {
                     .take(max_number_of_packets.saturating_sub(packet_bufs.len()))
                     .for_each(|buf| packet_bufs.push(PacketBuf { buf, packet_len: 0 }));
 
-                while packet_bufs.len() < 1 {
+                while packet_bufs.len() < max_number_of_packets {
                     buf_count += 1;
                     log::info!("Incoming buffer count: {buf_count}");
                     let buf = datagram_buffer();
