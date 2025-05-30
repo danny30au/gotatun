@@ -1,13 +1,11 @@
 use std::{
-    io::{self, IoSliceMut},
+    io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use linux::VectorizedUdpSocket;
-use nix::sys::socket::{MsgFlags, MultiHeaders, SockaddrIn};
-use tokio::io::Interest;
 
 use crate::device::PacketBuf;
 
@@ -93,51 +91,10 @@ impl UdpTransport for Arc<tokio::net::UdpSocket> {
     /// - 'source_addrs' - Source addresses to receive. The length must equal that of 'bufs'.
     async fn recv_vectored(
         &self,
-        bufs: &mut [PacketBuf],
-        source_addrs: &mut [Option<SocketAddr>],
+        _bufs: &mut [PacketBuf],
+        _source_addrs: &mut [Option<SocketAddr>],
     ) -> io::Result<usize> {
-        debug_assert_eq!(bufs.len(), source_addrs.len());
-
-        use std::os::fd::AsRawFd;
-        let fd = self.as_raw_fd();
-
-        let (num_bufs, lens) = self
-            .async_io(Interest::READABLE, || {
-                let n_packets = bufs.len();
-                let mut headers = MultiHeaders::<SockaddrIn>::preallocate(n_packets, None);
-
-                let mut msgs = Vec::with_capacity(n_packets);
-                msgs.extend(
-                    bufs.iter_mut()
-                        .map(|buf| [IoSliceMut::new(&mut buf.buf[..])]),
-                );
-
-                let results = nix::sys::socket::recvmmsg(
-                    fd,
-                    &mut headers,
-                    msgs.iter_mut(),
-                    MsgFlags::MSG_DONTWAIT,
-                    None,
-                )?;
-
-                // FIXME :(
-                let mut lens = Vec::with_capacity(n_packets);
-                for (out_addr, result) in source_addrs.iter_mut().zip(results.into_iter()) {
-                    lens.push(result.bytes);
-                    *out_addr = result.address.map(|addr| addr.into());
-                }
-                let num_bufs = lens.len();
-
-                Ok((num_bufs, lens))
-            })
-            .await?;
-
-        for (buf, len) in bufs.iter_mut().zip(lens) {
-            // FIXME :(
-            buf.packet_len = len;
-        }
-
-        Ok(num_bufs)
+        todo!("implement using recv_from")
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {

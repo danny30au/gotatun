@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use nix::sys::socket::{setsockopt, sockopt, MsgFlags, MultiHeaders, SockaddrStorage};
+use nix::sys::socket::{setsockopt, sockopt, MsgFlags, MultiHeaders, SockaddrIn, SockaddrStorage};
 use std::{
-    io::{self, IoSlice},
+    io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
     os::fd::{AsFd, AsRawFd},
     sync::Arc,
@@ -102,7 +102,49 @@ impl UdpTransport for VectorizedUdpSocket {
         bufs: &mut [PacketBuf],
         source_addrs: &mut [Option<SocketAddr>],
     ) -> io::Result<usize> {
-        self.udp_socket.recv_vectored(bufs, source_addrs).await
+        debug_assert_eq!(bufs.len(), source_addrs.len());
+
+        use std::os::fd::AsRawFd;
+        let fd = self.udp_socket.as_raw_fd();
+
+        let (num_bufs, lens) = self
+            .udp_socket
+            .async_io(Interest::READABLE, || {
+                let n_packets = bufs.len();
+                let mut headers = MultiHeaders::<SockaddrIn>::preallocate(n_packets, None);
+
+                let mut msgs = Vec::with_capacity(n_packets);
+                msgs.extend(
+                    bufs.iter_mut()
+                        .map(|buf| [IoSliceMut::new(&mut buf.buf[..])]),
+                );
+
+                let results = nix::sys::socket::recvmmsg(
+                    fd,
+                    &mut headers,
+                    msgs.iter_mut(),
+                    MsgFlags::MSG_DONTWAIT,
+                    None,
+                )?;
+
+                // FIXME :(
+                let mut lens = Vec::with_capacity(n_packets);
+                for (out_addr, result) in source_addrs.iter_mut().zip(results.into_iter()) {
+                    lens.push(result.bytes);
+                    *out_addr = result.address.map(|addr| addr.into());
+                }
+                let num_bufs = lens.len();
+
+                Ok((num_bufs, lens))
+            })
+            .await?;
+
+        for (buf, len) in bufs.iter_mut().zip(lens) {
+            // FIXME :(
+            buf.packet_len = len;
+        }
+
+        Ok(num_bufs)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
