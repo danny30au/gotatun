@@ -158,11 +158,22 @@ impl RateLimiter {
         dst: &'b mut [u8],
     ) -> Result<Packet<'a>, TunnResult<'b>> {
         let packet = Tunn::parse_incoming_packet(src)?;
+        self.rate_limit_packet(src_addr, src, &packet, dst)?;
+        Ok(packet)
+    }
 
+    pub fn rate_limit_packet<'a>(
+        &self,
+        src_addr: Option<IpAddr>,
+        src: &[u8],
+        packet: &Packet<'_>,
+        dst: &'a mut [u8],
+    ) -> Result<(), TunnResult<'a>> {
         // Verify and rate limit handshake messages only
         if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
         | Packet::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
         {
+            // FIXME: Take buffer from 'packet'
             let (msg, macs) = src.split_at(src.len() - 32);
             let (mac1, mac2) = macs.split_at(16);
 
@@ -182,13 +193,12 @@ impl RateLimiter {
 
                 if verify_slices_are_equal(&computed_mac2[..16], mac2).is_err() {
                     let cookie_packet = self
-                        .format_cookie_reply(sender_idx, cookie, mac1, dst)
+                        .format_cookie_reply(*sender_idx, cookie, mac1, dst)
                         .map_err(TunnResult::Err)?;
                     return Err(TunnResult::WriteToNetwork(cookie_packet));
                 }
             }
         }
-
-        Ok(packet)
+        Ok(())
     }
 }

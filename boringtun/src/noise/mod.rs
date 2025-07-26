@@ -43,10 +43,18 @@ const N_SESSIONS: usize = 8;
 
 #[derive(Debug)]
 pub enum TunnResult<'a> {
+    /// Processed. No action needed?
     Done,
+    /// An error occurred
     Err(WireGuardError),
+    /// UDP datagram to be sent to the WG endpoint
+    /// The slice should point into a provided dst buffer
     WriteToNetwork(&'a mut [u8]),
+    /// IPv4 packet to be written to the tunnel interface
+    /// The slice should point into a provided dst buffer
     WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
+    /// IPv6 packet to be written to the tunnel interface
+    /// The slice should point into a provided dst buffer
     WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
 }
 
@@ -90,6 +98,9 @@ pub struct HandshakeInit<'a> {
     unencrypted_ephemeral: &'a [u8; 32],
     encrypted_static: &'a [u8],
     encrypted_timestamp: &'a [u8],
+    //msg: &'a [u8],
+    //mac1: &'a [u8],
+    //mac2: &'a [u8],
 }
 
 #[derive(Debug)]
@@ -98,6 +109,9 @@ pub struct HandshakeResponse<'a> {
     pub receiver_idx: u32,
     unencrypted_ephemeral: &'a [u8; 32],
     encrypted_nothing: &'a [u8],
+    //msg: &'a [u8],
+    //mac1: &'a [u8],
+    //mac2: &'a [u8],
 }
 
 #[derive(Debug)]
@@ -140,6 +154,9 @@ impl Tunn {
                     .expect("length already checked above"),
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
+                //msg: &src[..(HANDSHAKE_INIT_SZ - 32)],
+                //mac1: &src[(HANDSHAKE_INIT_SZ - 32)..(HANDSHAKE_INIT_SZ - 16)],
+                //mac2: &src[(HANDSHAKE_INIT_SZ - 16)..],
             }),
             (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
@@ -147,6 +164,9 @@ impl Tunn {
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
                     .expect("length already checked above"),
                 encrypted_nothing: &src[44..60],
+                //msg: &src[..(HANDSHAKE_INIT_SZ - 32)],
+                //mac1: &src[(HANDSHAKE_INIT_SZ - 32)..(HANDSHAKE_INIT_SZ - 16)],
+                //mac2: &src[(HANDSHAKE_INIT_SZ - 16)..],
             }),
             (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
