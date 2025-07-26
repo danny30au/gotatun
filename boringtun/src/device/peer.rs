@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 use std::collections::hash_map::Values;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock};
@@ -111,6 +112,7 @@ impl Peer {
 }
 
 pub struct SingleDeviceFwd {
+    tun_tx_task: JoinHandle<()>,
     tun_rx_task: JoinHandle<()>,
     udp_rx_task: JoinHandle<()>,
     tx_bytes: Arc<AtomicUsize>,
@@ -124,8 +126,8 @@ impl SingleDeviceFwd {
         mut single_peer_tun: SinglePeerTun,
     ) -> Self {
         enum PeerMessage {
-            HandleOutgoingPacket(PacketBuf<4096>),
-            HandleIncomingPacket(IpAddr, PacketBuf<4096>),
+            HandleOutgoingPacket(BorrowedBuf<PacketBuf>),
+            HandleIncomingPacket(IpAddr, BorrowedBuf<PacketBuf>),
         }
 
         let tx_bytes = Arc::new(AtomicUsize::new(0));
@@ -133,48 +135,127 @@ impl SingleDeviceFwd {
         let tx_bytes2 = Arc::clone(&tx_bytes);
         let rx_bytes2 = Arc::clone(&rx_bytes);
 
-        let (tun_packet_buf_tx, mut tun_packet_buf_rx) = mpsc::channel(1000);
-        let (udp_packet_buf_tx, mut udp_packet_buf_rx) = mpsc::channel(1000);
+        let (tun_tx_tx, mut tun_tx_rx): (_, mpsc::Receiver<BorrowedBuf<PacketBuf>>) = mpsc::channel(2000);
+        let (udp_tx_tx, mut udp_tx_rx): (_, mpsc::Receiver<BorrowedBuf<PacketBuf>>) = mpsc::channel(2000);
 
-        let (peer_tx, mut peer_rx) = mpsc::channel(1000);
+        let (peer_tx, mut peer_rx) = mpsc::channel(2000);
         let udp_tx = endpoint_socket.clone();
         let tun_writer = tun_device.clone();
+
+        let endpoint_addr = single_peer_tun.peer.endpoint().addr.unwrap();
+
+        let peer_tx2 = peer_tx.clone();
+
+        let packet_buffers: PacketPool<PacketBuf> = PacketPool::new(2000);
+
+        let tun_packet_buffers = packet_buffers.clone();
+        let tun_rx_task = tokio::spawn(async move {
+            loop {
+                let mut buf = tun_packet_buffers.get();
+                match tun_device.recv(&mut buf.buf[..]).await {
+                    Ok(n) => {
+                        buf.packet_len = n;
+                        peer_tx
+                            .send(PeerMessage::HandleOutgoingPacket(buf))
+                            .await
+                            .expect("Failed to send packet from tun to peer handler");
+                    }
+                    Err(_err) => {
+                        // TODO: Ignore some errors
+                        log::error!("Error receiving from tun device: {}", _err);
+                        return;
+                    }
+                }
+            }
+        });
+
+        let tun_tx_task = tokio::spawn(async move {
+            loop {
+                match tun_tx_rx.recv().await {
+                    Some(buf) => {
+                        if let Err(e) = tun_writer.send(buf.packet()).await {
+                            log::error!("Error sending packet to network: {}", e);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        let udp_packet_buffers = packet_buffers.clone();
+        let udp_rx_task = tokio::spawn(async move {
+            loop {
+                let mut buf = udp_packet_buffers.get();
+                match endpoint_socket.recv_from(&mut buf.buf[..]).await {
+                    Ok((n, src_addr)) => {
+                        buf.packet_len = n;
+                        peer_tx2
+                            .send(PeerMessage::HandleIncomingPacket(src_addr.ip(), buf))
+                            .await
+                            .expect("Failed to send packet from UDP to peer handler");
+                    }
+                    Err(_err) => {
+                        // TODO: Ignore some errors
+                        log::error!("Error receiving from endpoint socket: {}", _err);
+                        return;
+                    }
+                }
+            }
+        });
+
+        let udp_tx_task = tokio::spawn(async move {
+            loop {
+                match udp_tx_rx.recv().await {
+                    Some(buf) => {
+                        if let Err(e) = udp_tx.send_to(buf.packet(), endpoint_addr).await {
+                            log::error!("Error sending packet to network: {}", e);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+
         tokio::spawn(async move {
-            // TODO: handle timers
-
-            let mut dst = PacketBuf::<4096>::new();
-            let endpoint_addr = single_peer_tun.peer.endpoint().addr.unwrap();
-
             // Note: All peer tasks are handled in the same task, since they require mutable access
             let mut next_timer_event = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(250)));
             loop {
+                let mut dst = packet_buffers.get();
+
                 tokio::select! {
                     peer_message = peer_rx.recv() => {
                         match peer_message {
-                            Some(PeerMessage::HandleOutgoingPacket(buf)) => {
+                            Some(PeerMessage::HandleOutgoingPacket(mut buf)) => {
                                 match single_peer_tun.handle_outgoing_packet(buf.packet(), &mut dst.buf[..]) {
                                     TunnResult::WriteToNetwork(packet) => {
-                                        if let Err(e) = udp_tx.send_to(packet, endpoint_addr).await {
-                                            log::error!("Error sending packet to network: {}", e);
+                                        buf.buf[..packet.len()].copy_from_slice(packet);
+                                        buf.packet_len = packet.len();
+                                        if let Err(err) = udp_tx_tx.send(buf).await {
+                                            log::error!("Failed: udp_tx_tx.send: {err}");
                                         }
                                     }
                                     // TODO: Handle other cases?
-                                    _ => (),
+                                    _ => ()
                                 }
-                                let _ = tun_packet_buf_tx.try_send(buf);
                             }
-                            Some(PeerMessage::HandleIncomingPacket(src_addr, buf)) => {
+                            Some(PeerMessage::HandleIncomingPacket(src_addr, mut buf)) => {
                                 match single_peer_tun.handle_incoming_packet(src_addr, buf.packet(), &mut dst.buf[..]) {
                                     TunnResult::WriteToNetwork(packet) => {
-                                        if let Err(e) = udp_tx.send_to(packet, endpoint_addr).await {
-                                            log::error!("Error sending packet to network: {}", e);
+                                        buf.buf[..packet.len()].copy_from_slice(packet);
+                                        buf.packet_len = packet.len();
+                                        if let Err(err) = udp_tx_tx.send(buf).await {
+                                            log::error!("Failed: udp_tx_tx.send: {err}");
                                         }
 
                                         // Flush outgoing packet queue
                                         loop {
                                             match single_peer_tun.peer.tunnel.decapsulate(None, &[], &mut dst.buf[..]) {
                                                 TunnResult::WriteToNetwork(packet) => {
-                                                    let _ = udp_tx.send_to(packet, endpoint_addr).await;
+                                                    let mut buf = packet_buffers.get();
+                                                    buf.buf[..packet.len()].copy_from_slice(packet);
+                                                    buf.packet_len = packet.len();
+
+                                                    let _ = udp_tx_tx.send(buf).await;
                                                 }
                                                 TunnResult::Done => break,
                                                 TunnResult::Err(_) => continue,
@@ -183,15 +264,15 @@ impl SingleDeviceFwd {
                                         }
                                     }
                                     TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                                        if let Err(e) = tun_writer.send(packet).await {
-                                            log::error!("Error sending packet to tunnel: {}", e);
+                                        buf.buf[..packet.len()].copy_from_slice(packet);
+                                        buf.packet_len = packet.len();
+                                        if let Err(err) = tun_tx_tx.send(buf).await {
+                                            log::error!("Failed: tun_tx_tx.send: {err}");
                                         }
                                     }
                                     // TODO: Handle other cases?
                                     _ => (),
                                 }
-                                // Reuse buf
-                                let _ = udp_packet_buf_tx.try_send(buf);
                             }
                             None => break,
                         }
@@ -202,9 +283,13 @@ impl SingleDeviceFwd {
                             TunnResult::Err(WireGuardError::ConnectionExpired) => {}
                             TunnResult::Err(e) => log::error!("Timer error = {e:?}: {e:?}"),
                             TunnResult::WriteToNetwork(packet) => {
+                                let mut buf = packet_buffers.get();
+                                buf.buf[..packet.len()].copy_from_slice(packet);
+                                buf.packet_len = packet.len();
+
                                 match endpoint_addr {
-                                    SocketAddr::V4(_) => udp_tx.send_to(packet, endpoint_addr).await.ok(),
-                                    SocketAddr::V6(_) => udp_tx.send_to(packet, endpoint_addr).await.ok(),
+                                    SocketAddr::V4(_) => udp_tx_tx.send(buf).await.ok(),
+                                    SocketAddr::V6(_) => udp_tx_tx.send(buf).await.ok(),
                                 };
                             }
                             _ => unreachable!("unexpected result from update_timers"),
@@ -224,55 +309,13 @@ impl SingleDeviceFwd {
             }
         });
 
-        let peer_tx2 = peer_tx.clone();
-        let peer_tx3 = peer_tx.clone();
-
-        let tun_rx_task = tokio::spawn(async move {
-            loop {
-                let mut buf = tun_packet_buf_rx.try_recv().unwrap_or(PacketBuf::<4096>::new());
-                match tun_device.recv(&mut buf.buf[..]).await {
-                    Ok(n) => {
-                        buf.packet_len = n;
-                        peer_tx
-                            .send(PeerMessage::HandleOutgoingPacket(buf))
-                            .await
-                            .expect("Failed to send packet from tun to peer handler");
-                    }
-                    Err(_err) => {
-                        // TODO: Ignore some errors
-                        log::error!("Error receiving from tun device: {}", _err);
-                        return;
-                    }
-                }
-            }
-        });
-
-        let udp_rx_task = tokio::spawn(async move {
-            loop {
-                let mut buf = udp_packet_buf_rx.try_recv().unwrap_or(PacketBuf::<4096>::new());
-                match endpoint_socket.recv_from(&mut buf.buf[..]).await {
-                    Ok((n, src_addr)) => {
-                        buf.packet_len = n;
-                        peer_tx2
-                            .send(PeerMessage::HandleIncomingPacket(src_addr.ip(), buf))
-                            .await
-                            .expect("Failed to send packet from UDP to peer handler");
-                    }
-                    Err(_err) => {
-                        // TODO: Ignore some errors
-                        log::error!("Error receiving from endpoint socket: {}", _err);
-                        return;
-                    }
-                }
-            }
-        });
-
-        SingleDeviceFwd { tun_rx_task, udp_rx_task, tx_bytes: tx_bytes2, rx_bytes: rx_bytes2 }
+        SingleDeviceFwd { tun_tx_task, tun_rx_task, udp_rx_task, tx_bytes: tx_bytes2, rx_bytes: rx_bytes2 }
     }
 
     pub fn stop(&self) {
         self.udp_rx_task.abort();
         self.tun_rx_task.abort();
+        self.tun_tx_task.abort();
     }
 
     /// * Data bytes sent
@@ -286,6 +329,83 @@ impl SingleDeviceFwd {
 impl Drop for SingleDeviceFwd {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// A glorified mpsc channel for reusable packet buffers.
+pub struct PacketPool<Buf> {
+    tx: mpsc::Sender<Buf>,
+    rx: Arc<std::sync::Mutex<mpsc::Receiver<Buf>>>,
+}
+
+impl<Buf: Default> PacketPool<Buf> {
+    pub fn new(capacity: usize) -> Self {
+        let (tx, rx) = mpsc::channel(capacity);
+        PacketPool { tx, rx: Arc::new(std::sync::Mutex::new(rx)) }
+    }
+
+    /// Retrieve a new buffer.
+    ///
+    /// If none is available, allocate a new one.
+    pub fn get(&self) -> BorrowedBuf<Buf> {
+        let mut rx = self.rx.lock().unwrap();
+        let inner = rx.try_recv().unwrap_or_else(|_| Buf::default());
+        drop(rx);
+
+        BorrowedBuf {
+            tx: self.tx.clone(),
+            inner: Some(inner),
+        }
+    }
+}
+
+impl<Buf> Clone for PacketPool<Buf> {
+    fn clone(&self) -> Self {
+        PacketPool {
+            tx: self.tx.clone(),
+            rx: Arc::clone(&self.rx),
+        }
+    }
+}
+
+/// See [PacketBuffers]. When dropped, the buffer is returned to the pool.
+#[derive(Clone)]
+pub struct BorrowedBuf<Buf> {
+    // wasteful :(
+    tx: mpsc::Sender<Buf>,
+    inner: Option<Buf>,
+}
+
+impl<Buf> BorrowedBuf<Buf> {
+    /// Restore packet to the channel for reuse.
+    ///
+    /// If the channel is already full, this does nothing.
+    pub fn free(mut self) {
+        self.free_inner();
+    }
+
+    fn free_inner(&mut self) {
+        let _ = self.tx.try_send(self.inner.take().unwrap());
+    }
+}
+
+impl<Buf> Deref for BorrowedBuf<Buf> {
+    type Target = Buf;
+
+    fn deref(&self) -> &Buf {
+        self.inner.as_ref().expect("buf should not be None")
+    }
+}
+
+impl<Buf> DerefMut for BorrowedBuf<Buf> {
+    fn deref_mut(&mut self) -> &mut Buf {
+        self.inner.as_mut().expect("buf should not be None")
+    }
+}
+
+impl<Buf> Drop for BorrowedBuf<Buf> {
+    fn drop(&mut self) {
+        self.free_inner();
     }
 }
 

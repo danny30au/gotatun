@@ -235,3 +235,9 @@ impl<const N: usize> PacketBuf<N> {
         &self.buf[..self.packet_len]
     }
 }
+
+impl Default for PacketBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
