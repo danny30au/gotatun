@@ -234,6 +234,12 @@ impl<const N: usize> PacketBuf<N> {
     pub fn packet(&self) -> &[u8] {
         &self.buf[..self.packet_len]
     }
+
+    /// Copy a slice into this packet buffer
+    pub fn copy_from(&mut self, data: &[u8]) {
+        self.buf[..data.len()].copy_from_slice(data);
+        self.packet_len = data.len();
+    }
 }
 
 impl Default for PacketBuf {

@@ -228,8 +228,7 @@ impl SingleDeviceFwd {
                             Some(PeerMessage::HandleOutgoingPacket(mut buf)) => {
                                 match single_peer_tun.handle_outgoing_packet(buf.packet(), &mut dst.buf[..]) {
                                     TunnResult::WriteToNetwork(packet) => {
-                                        buf.buf[..packet.len()].copy_from_slice(packet);
-                                        buf.packet_len = packet.len();
+                                        buf.copy_from(packet);
                                         if let Err(err) = udp_tx_tx.send(buf).await {
                                             log::error!("Failed: udp_tx_tx.send: {err}");
                                         }
@@ -241,8 +240,7 @@ impl SingleDeviceFwd {
                             Some(PeerMessage::HandleIncomingPacket(src_addr, mut buf)) => {
                                 match single_peer_tun.handle_incoming_packet(src_addr, buf.packet(), &mut dst.buf[..]) {
                                     TunnResult::WriteToNetwork(packet) => {
-                                        buf.buf[..packet.len()].copy_from_slice(packet);
-                                        buf.packet_len = packet.len();
+                                        buf.copy_from(packet);
                                         if let Err(err) = udp_tx_tx.send(buf).await {
                                             log::error!("Failed: udp_tx_tx.send: {err}");
                                         }
@@ -252,8 +250,7 @@ impl SingleDeviceFwd {
                                             match single_peer_tun.peer.tunnel.decapsulate(None, &[], &mut dst.buf[..]) {
                                                 TunnResult::WriteToNetwork(packet) => {
                                                     let mut buf = packet_buffers.get();
-                                                    buf.buf[..packet.len()].copy_from_slice(packet);
-                                                    buf.packet_len = packet.len();
+                                                    buf.copy_from(packet);
 
                                                     let _ = udp_tx_tx.send(buf).await;
                                                 }
@@ -264,8 +261,7 @@ impl SingleDeviceFwd {
                                         }
                                     }
                                     TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                                        buf.buf[..packet.len()].copy_from_slice(packet);
-                                        buf.packet_len = packet.len();
+                                        buf.copy_from(packet);
                                         if let Err(err) = tun_tx_tx.send(buf).await {
                                             log::error!("Failed: tun_tx_tx.send: {err}");
                                         }
@@ -284,8 +280,7 @@ impl SingleDeviceFwd {
                             TunnResult::Err(e) => log::error!("Timer error = {e:?}: {e:?}"),
                             TunnResult::WriteToNetwork(packet) => {
                                 let mut buf = packet_buffers.get();
-                                buf.buf[..packet.len()].copy_from_slice(packet);
-                                buf.packet_len = packet.len();
+                                buf.copy_from(packet);
 
                                 match endpoint_addr {
                                     SocketAddr::V4(_) => udp_tx_tx.send(buf).await.ok(),
