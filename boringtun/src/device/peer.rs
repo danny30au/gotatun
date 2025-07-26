@@ -135,10 +135,12 @@ impl SingleDeviceFwd {
         let tx_bytes2 = Arc::clone(&tx_bytes);
         let rx_bytes2 = Arc::clone(&rx_bytes);
 
-        let (tun_tx_tx, mut tun_tx_rx): (_, mpsc::Receiver<BorrowedBuf<PacketBuf>>) = mpsc::channel(2000);
-        let (udp_tx_tx, mut udp_tx_rx): (_, mpsc::Receiver<BorrowedBuf<PacketBuf>>) = mpsc::channel(2000);
+        let (tun_tx_tx, mut tun_tx_rx): (_, mpsc::Receiver<BorrowedBuf<PacketBuf>>) =
+            mpsc::channel(5000);
+        let (udp_tx_tx, mut udp_tx_rx): (_, mpsc::Receiver<BorrowedBuf<PacketBuf>>) =
+            mpsc::channel(5000);
 
-        let (peer_tx, mut peer_rx) = mpsc::channel(2000);
+        let (peer_tx, mut peer_rx) = mpsc::channel(5000);
         let udp_tx = endpoint_socket.clone();
         let tun_writer = tun_device.clone();
 
@@ -218,7 +220,8 @@ impl SingleDeviceFwd {
 
         tokio::spawn(async move {
             // Note: All peer tasks are handled in the same task, since they require mutable access
-            let mut next_timer_event = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(250)));
+            let mut next_timer_event =
+                Box::pin(tokio::time::sleep(std::time::Duration::from_millis(250)));
             loop {
                 let mut dst = packet_buffers.get();
 
@@ -304,7 +307,13 @@ impl SingleDeviceFwd {
             }
         });
 
-        SingleDeviceFwd { tun_tx_task, tun_rx_task, udp_rx_task, tx_bytes: tx_bytes2, rx_bytes: rx_bytes2 }
+        SingleDeviceFwd {
+            tun_tx_task,
+            tun_rx_task,
+            udp_rx_task,
+            tx_bytes: tx_bytes2,
+            rx_bytes: rx_bytes2,
+        }
     }
 
     pub fn stop(&self) {
@@ -316,8 +325,10 @@ impl SingleDeviceFwd {
     /// * Data bytes sent
     /// * Data bytes received
     pub fn stats(&self) -> (usize, usize) {
-        (self.tx_bytes.load(std::sync::atomic::Ordering::Relaxed),
-         self.rx_bytes.load(std::sync::atomic::Ordering::Relaxed))
+        (
+            self.tx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            self.rx_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 }
 
@@ -336,7 +347,10 @@ pub struct PacketPool<Buf> {
 impl<Buf: Default> PacketPool<Buf> {
     pub fn new(capacity: usize) -> Self {
         let (tx, rx) = mpsc::channel(capacity);
-        PacketPool { tx, rx: Arc::new(std::sync::Mutex::new(rx)) }
+        PacketPool {
+            tx,
+            rx: Arc::new(std::sync::Mutex::new(rx)),
+        }
     }
 
     /// Retrieve a new buffer.
