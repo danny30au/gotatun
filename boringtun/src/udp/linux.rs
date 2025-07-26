@@ -4,6 +4,7 @@ use nix::sys::socket::{setsockopt, sockopt};
 use std::{
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
+    ops::DerefMut,
     os::fd::AsRawFd,
 };
 use tokio::io::Interest;
@@ -22,10 +23,10 @@ pub struct SendmmsgBuf {
 impl UdpTransport for tokio::net::UdpSocket {
     type SendManyBuf = SendmmsgBuf;
 
-    async fn send_many_to(
+    async fn send_many_to<B: DerefMut<Target = PacketBuf> + Sync>(
         &self,
         buf: &mut SendmmsgBuf,
-        packets: &[(PacketBuf, SocketAddr)],
+        packets: &[(B, SocketAddr)],
     ) -> io::Result<()> {
         let n = packets.len();
         debug_assert!(n <= MAX_PACKET_COUNT);
@@ -84,9 +85,9 @@ impl UdpTransport for tokio::net::UdpSocket {
         self.recv_from(buf).await
     }
 
-    async fn recv_many_from(
+    async fn recv_many_from<B: DerefMut<Target = PacketBuf>>(
         &self,
-        bufs: &mut [PacketBuf],
+        bufs: &mut [B],
         source_addrs: &mut [Option<SocketAddr>],
     ) -> io::Result<usize> {
         debug_assert_eq!(bufs.len(), source_addrs.len());
@@ -99,7 +100,10 @@ impl UdpTransport for tokio::net::UdpSocket {
 
                 let (mut msgs, mut packet_lens): (Vec<_>, Vec<_>) = bufs
                     .iter_mut()
-                    .map(|buf| ([IoSliceMut::new(&mut buf.buf[..])], &mut buf.packet_len))
+                    .map(|buf| {
+                        let buf = buf.deref_mut();
+                        ([IoSliceMut::new(&mut buf.buf[..])], &mut buf.packet_len)
+                    })
                     .unzip();
 
                 let results = nix::sys::socket::recvmmsg(

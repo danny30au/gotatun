@@ -2,6 +2,7 @@ use std::{
     future::Future,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    ops::DerefMut,
     sync::Arc,
 };
 
@@ -66,10 +67,10 @@ pub trait UdpTransport: Send + Sync {
     /// Send up to `x` UDP packets to the destination,
     /// where `x` is [UdpTransport::max_number_of_packets_to_send];
     // TODO: define how many packets are sent in case of an error.
-    fn send_many_to(
+    fn send_many_to<B: DerefMut<Target = PacketBuf> + Sync>(
         &self,
         _bufs: &mut Self::SendManyBuf,
-        packets: &[(PacketBuf, SocketAddr)],
+        packets: &[(B, SocketAddr)],
     ) -> impl Future<Output = io::Result<()>> + Send {
         generic_send_many_to(self, packets)
     }
@@ -84,9 +85,9 @@ pub trait UdpTransport: Send + Sync {
     /// - 'source_addrs' - Source addresses to receive. The length must equal that of 'bufs'.
     //
     // The default implementation always reads 1 packet.
-    fn recv_many_from(
+    fn recv_many_from<B: DerefMut<Target = PacketBuf> + Send>(
         &self,
-        bufs: &mut [PacketBuf],
+        bufs: &mut [B],
         source_addrs: &mut [Option<SocketAddr>],
     ) -> impl Future<Output = io::Result<usize>> + Send {
         async {
@@ -103,9 +104,9 @@ pub trait UdpTransport: Send + Sync {
     }
 }
 
-async fn generic_send_many_to<U: UdpTransport + ?Sized>(
+async fn generic_send_many_to<U: UdpTransport + ?Sized, B: DerefMut<Target = PacketBuf>>(
     transport: &U,
-    packets: &[(PacketBuf, SocketAddr)],
+    packets: &[(B, SocketAddr)],
 ) -> io::Result<()> {
     for (packet, target) in packets {
         transport.send_to(packet.packet(), *target).await?;
