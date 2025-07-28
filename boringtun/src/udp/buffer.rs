@@ -158,6 +158,34 @@ impl<U: UdpTransport> UdpTransport for BufferedUdpTransport<U> {
         Ok((rx_packet.packet_len(), src))
     }
 
+    async fn recv_many_from(
+        &self,
+        buf: &mut [PacketBuf],
+        src_addrs: &mut [Option<SocketAddr>],
+    ) -> io::Result<usize> {
+        let mut rx = self.recv_rx.try_lock().expect("simultaneous recv");
+        for (i, (buf, src_addr)) in buf.iter_mut().zip(src_addrs.iter_mut()).enumerate() {
+            match rx.try_recv() {
+                Ok((received_buf, received_addr)) => {
+                    *buf = received_buf;
+                    *src_addr = Some(received_addr);
+                }
+                Err(mpsc::error::TryRecvError::Empty) if i == 0 => {
+                    let Some((received_buf, received_addr)) = rx.recv().await else {
+                        return Err(io::Error::other("No packet available"));
+                    };
+                    *buf = received_buf;
+                    *src_addr = Some(received_addr);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(i),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(io::Error::other("No packet available"));
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
     // TODO: implement recv_from many with mpsc::Receiver::recv_many?
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {

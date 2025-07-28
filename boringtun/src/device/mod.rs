@@ -594,94 +594,103 @@ impl<T: DeviceTransports> Device<T> {
 
         let decapsulate_task = Task::spawn("decapsulate", async move {
             // NOTE: Reusing this appears to be faster than grabbing a buffer and using it for replies
-            let mut src_buf = packet_pool.get();
             let mut dst_buf = packet_pool.get();
 
-            while let Ok((n, addr)) = udp.recv_from(src_buf.packet_mut()).await {
-                src_buf.len = n;
+            let mut src_bufs: Vec<_> = std::iter::repeat_with(|| packet_pool.get())
+                .take(udp.max_number_of_packets_to_recv())
+                .collect();
+            let mut addr_bufs = vec![None; src_bufs.len()];
 
-                let parsed_packet = match rate_limiter.verify_packet(
-                    Some(addr.ip()),
-                    src_buf.packet(),
-                    dst_buf.packet_mut(),
-                ) {
-                    Ok(packet) => packet,
-                    Err(TunnResult::WriteToNetwork(cookie)) => {
-                        if let Err(_err) = udp.send_to(cookie, addr).await {
-                            log::trace!("udp.send_to failed");
-                            break;
-                        }
-                        continue;
-                    }
-                    Err(_) => continue,
-                };
-
-                let Some(device) = device.upgrade() else {
-                    break;
-                };
-                let device_guard = &device.read().await;
-                let peers = &device_guard.peers;
-                let peers_by_idx = &device_guard.peers_by_idx;
-                let peer = match &parsed_packet {
-                    Packet::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
-                        .ok()
-                        .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public))),
-                    Packet::HandshakeResponse(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
-                    Packet::PacketCookieReply(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
-                    Packet::PacketData(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
-                };
-                let Some(peer) = peer else {
-                    continue;
-                };
-                let mut peer = peer.lock().await;
-                let mut flush = false;
-                match peer
-                    .tunnel
-                    .handle_verified_packet(parsed_packet, dst_buf.packet_mut())
-                {
-                    TunnResult::Done => (),
-                    TunnResult::Err(_) => continue,
-                    TunnResult::WriteToNetwork(packet) => {
-                        flush = true;
-                        if let Err(_err) = udp.send_to(packet, addr).await {
-                            log::trace!("udp.send_to failed");
-                            break;
-                        }
-                    }
-                    TunnResult::WriteToTunnelV4(packet, addr) => {
-                        if peer.is_allowed_ip(addr)
-                            && let Err(_err) = buffered_tun_send.send(packet).await
-                        {
-                            log::trace!("buffered_tun_send.send failed");
-                            break;
-                        }
-                    }
-                    TunnResult::WriteToTunnelV6(packet, addr) => {
-                        if peer.is_allowed_ip(addr)
-                            && let Err(_err) = buffered_tun_send.send(packet).await
-                        {
-                            log::trace!("buffered_tun_send.send failed");
-                            break;
-                        }
-                    }
-                };
-
-                if flush {
-                    // Flush pending queue
-                    loop {
-                        match peer.tunnel.decapsulate(None, &[], dst_buf.packet_mut()) {
-                            TunnResult::WriteToNetwork(packet) => {
-                                if let Err(_err) = udp.send_to(packet, addr).await {
-                                    log::trace!("udp.send_to failed");
-                                    break;
-                                }
+            while let Ok(n) = udp.recv_many_from(&mut src_bufs, &mut addr_bufs).await {
+                for (src_buf, addr) in src_bufs[..n].iter_mut().zip(&addr_bufs[..n]) {
+                    let addr = addr.unwrap();
+                    let parsed_packet = match rate_limiter.verify_packet(
+                        Some(addr.ip()),
+                        src_buf.packet(),
+                        dst_buf.packet_mut(),
+                    ) {
+                        Ok(packet) => packet,
+                        Err(TunnResult::WriteToNetwork(cookie)) => {
+                            if let Err(_err) = udp.send_to(cookie, addr).await {
+                                log::trace!("udp.send_to failed");
+                                break;
                             }
-                            TunnResult::Done => break,
-                            // TODO: why do we ignore this error?
-                            TunnResult::Err(_) => continue,
+                            continue;
+                        }
+                        Err(_) => continue,
+                    };
 
-                            // TODO: fix the types so we can't end up here.
-                            _ => panic!("unexpected TunnResult"),
+                    let Some(device) = device.upgrade() else {
+                        break;
+                    };
+                    let device_guard = &device.read().await;
+                    let peers = &device_guard.peers;
+                    let peers_by_idx = &device_guard.peers_by_idx;
+                    let peer = match &parsed_packet {
+                        Packet::HandshakeInit(p) => {
+                            parse_handshake_anon(&private_key, &public_key, p)
+                                .ok()
+                                .and_then(|hh| {
+                                    peers.get(&x25519::PublicKey::from(hh.peer_static_public))
+                                })
+                        }
+                        Packet::HandshakeResponse(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        Packet::PacketCookieReply(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        Packet::PacketData(p) => peers_by_idx.get(&(p.receiver_idx >> 8)),
+                    };
+                    let Some(peer) = peer else {
+                        continue;
+                    };
+                    let mut peer = peer.lock().await;
+                    let mut flush = false;
+                    match peer
+                        .tunnel
+                        .handle_verified_packet(parsed_packet, dst_buf.packet_mut())
+                    {
+                        TunnResult::Done => (),
+                        TunnResult::Err(_) => continue,
+                        TunnResult::WriteToNetwork(packet) => {
+                            flush = true;
+                            if let Err(_err) = udp.send_to(packet, addr).await {
+                                log::trace!("udp.send_to failed");
+                                break;
+                            }
+                        }
+                        TunnResult::WriteToTunnelV4(packet, addr) => {
+                            if peer.is_allowed_ip(addr)
+                                && let Err(_err) = buffered_tun_send.send(packet).await
+                            {
+                                log::trace!("buffered_tun_send.send failed");
+                                break;
+                            }
+                        }
+                        TunnResult::WriteToTunnelV6(packet, addr) => {
+                            if peer.is_allowed_ip(addr)
+                                && let Err(_err) = buffered_tun_send.send(packet).await
+                            {
+                                log::trace!("buffered_tun_send.send failed");
+                                break;
+                            }
+                        }
+                    };
+
+                    if flush {
+                        // Flush pending queue
+                        loop {
+                            match peer.tunnel.decapsulate(None, &[], dst_buf.packet_mut()) {
+                                TunnResult::WriteToNetwork(packet) => {
+                                    if let Err(_err) = udp.send_to(packet, addr).await {
+                                        log::trace!("udp.send_to failed");
+                                        break;
+                                    }
+                                }
+                                TunnResult::Done => break,
+                                // TODO: why do we ignore this error?
+                                TunnResult::Err(_) => continue,
+
+                                // TODO: fix the types so we can't end up here.
+                                _ => panic!("unexpected TunnResult"),
+                            }
                         }
                     }
                 }
@@ -749,8 +758,6 @@ impl<T: DeviceTransports> Device<T> {
                         log::error!("Encapsulate error={e:?}: {e:?}");
                     }
                     TunnResult::WriteToNetwork(packet) => {
-                        src_buf.copy_from(packet);
-
                         let endpoint_addr = peer.endpoint().addr;
                         if let Some(SocketAddr::V4(addr)) = endpoint_addr {
                             if udp4.send_to(packet, addr.into()).await.is_err() {
