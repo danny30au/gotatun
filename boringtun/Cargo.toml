@@ -68,6 +68,7 @@ nix = { version = "0.30", default-features = false, features = [
     "socket",
     "uio",
     "net",
+    "ioctl",
 ] }
 
 [dev-dependencies]
