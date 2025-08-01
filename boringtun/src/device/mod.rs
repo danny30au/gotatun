@@ -44,7 +44,7 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 
 /// Maximum number of packet buffers that each channel may contain
-const MAX_PACKET_BUFS: usize = 4000 * 10;
+const MAX_PACKET_BUFS: usize = 4000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

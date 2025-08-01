@@ -115,7 +115,8 @@ impl UdpRecv for super::UdpSocket {
     type RecvManyBuf = RecvManyBuf;
 
     fn max_number_of_packets_to_recv(&self) -> usize {
-        MAX_SEGMENTS * MAX_PACKET_COUNT
+        MAX_PACKET_COUNT
+        //MAX_SEGMENTS * MAX_PACKET_COUNT
     }
 
     async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -129,6 +130,8 @@ impl UdpRecv for super::UdpSocket {
         source_addrs: &mut [Option<SocketAddr>],
     ) -> io::Result<usize> {
         debug_assert_eq!(bufs.len(), source_addrs.len());
+
+        // TODO: make sure bufs always contains enough packets. it is potentially greater than MAX_PACKET_COUNT
 
         let fd = self.inner.as_raw_fd();
 
