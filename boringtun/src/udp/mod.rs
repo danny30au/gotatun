@@ -154,6 +154,17 @@ impl UdpSocket {
 
         let inner = tokio::net::UdpSocket::from_std(udp_sock.into())?;
 
+        use std::os::fd::AsFd;
+
+        // TODO: clean this up
+        // Enable GRO
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        nix::sys::socket::setsockopt(
+            &inner.as_fd(),
+            nix::sys::socket::sockopt::UdpGroSegment,
+            &true,
+        )?;
+
         Ok(Self {
             inner: Arc::new(inner),
         })
