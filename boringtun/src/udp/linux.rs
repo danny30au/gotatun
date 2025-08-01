@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{BytesMut, buf};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{setsockopt, sockopt};
 use nix::{
@@ -14,7 +14,7 @@ use std::{
 use tokio::io::Interest;
 
 use crate::{
-    packet::Packet,
+    packet::{Packet, PacketBufPool},
     udp::{UdpRecv, UdpSend},
 };
 
@@ -115,8 +115,7 @@ impl UdpRecv for super::UdpSocket {
     type RecvManyBuf = RecvManyBuf;
 
     fn max_number_of_packets_to_recv(&self) -> usize {
-        MAX_PACKET_COUNT
-        //MAX_SEGMENTS * MAX_PACKET_COUNT
+        MAX_SEGMENTS * MAX_PACKET_COUNT
     }
 
     async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -126,17 +125,13 @@ impl UdpRecv for super::UdpSocket {
     async fn recv_many_from(
         &mut self,
         recv_many_bufs: &mut Self::RecvManyBuf,
-        bufs: &mut VecDeque<Packet>,
+        pool: &mut PacketBufPool,
+        bufs: &mut Vec<Packet>,
         source_addrs: &mut [Option<SocketAddr>],
-    ) -> io::Result<usize> {
-        debug_assert_eq!(bufs.len(), source_addrs.len());
-
-        // TODO: make sure bufs always contains enough packets. it is potentially greater than MAX_PACKET_COUNT
-
+    ) -> io::Result<()> {
         let fd = self.inner.as_raw_fd();
 
-        let num_bufs = self
-            .inner
+        self.inner
             .async_io(Interest::READABLE, move || {
                 // TODO: the CMSG space cannot be reused, so we must allocate new headers each time
                 // [ControlMessageOwned::UdpGroSegments(i32)] contains the size of all smaller packets/segments
@@ -180,9 +175,11 @@ impl UdpRecv for super::UdpSocket {
                         // Segment the buffers into individual packets
                         let mut iov_offset = 0;
                         for _ in 0..(packet_count - 1) {
-                            bufs[bufs_index][..gro_size]
+                            let mut buf = pool.get();
+                            buf[..gro_size]
                                 .copy_from_slice(&iov[iov_offset..iov_offset + gro_size]);
-                            bufs[bufs_index].truncate(gro_size);
+                            buf.truncate(gro_size);
+                            bufs.push(buf);
 
                             iov_offset += gro_size;
 
@@ -195,9 +192,11 @@ impl UdpRecv for super::UdpSocket {
                         if remaining_bytes == 0 {
                             remaining_bytes = gro_size;
                         }
-                        bufs[bufs_index][..remaining_bytes]
+                        let mut buf = pool.get();
+                        buf[..remaining_bytes]
                             .copy_from_slice(&iov[iov_offset..iov_offset + remaining_bytes]);
-                        bufs[bufs_index].truncate(remaining_bytes);
+                        buf.truncate(remaining_bytes);
+                        bufs.push(buf);
 
                         source_addrs[bufs_index] = result.address.map(|addr| addr.into());
                         bufs_index += 1;
@@ -206,18 +205,20 @@ impl UdpRecv for super::UdpSocket {
                         source_addrs[bufs_index] = result.address.map(|addr| addr.into());
 
                         let size = result.bytes;
-                        bufs[bufs_index][..size].copy_from_slice(&iov[..size]);
-                        bufs[bufs_index].truncate(size);
+                        let mut buf = pool.get();
+                        buf[..size].copy_from_slice(&iov[..size]);
+                        buf.truncate(size);
+                        bufs.push(buf);
 
                         bufs_index += 1;
                     }
                 }
 
-                Ok(bufs_index)
+                Ok(())
             })
             .await?;
 
-        Ok(num_bufs)
+        Ok(())
     }
 }
 

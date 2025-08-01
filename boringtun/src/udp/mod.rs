@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::packet::Packet;
+use crate::packet::{Packet, PacketBufPool};
 
 pub mod buffer;
 
@@ -72,9 +72,10 @@ pub trait UdpRecv: Send + Sync {
     fn recv_many_from(
         &mut self,
         _recv_buf: &mut Self::RecvManyBuf,
-        bufs: &mut VecDeque<Packet>,
+        pool: &mut PacketBufPool,
+        packets: &mut Vec<Packet>,
         source_addrs: &mut [Option<SocketAddr>],
-    ) -> impl Future<Output = io::Result<usize>> + Send {
+    ) -> impl Future<Output = io::Result<()>> + Send {
         async { todo!() }
         /*async {
             let ([buf, ..], [source_addr_out, ..]) = (bufs, source_addrs) else {

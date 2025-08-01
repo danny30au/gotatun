@@ -83,24 +83,20 @@ impl BufferedUdpReceive {
 
         let recv_task = Task::spawn("buffered UDP receive", async move {
             let max_number_of_packets = udp_rx.max_number_of_packets_to_recv();
-            let mut packet_bufs = VecDeque::with_capacity(max_number_of_packets);
+            let mut packet_bufs = Vec::with_capacity(max_number_of_packets);
             let mut source_addrs = vec![None; max_number_of_packets];
 
             let mut recv_many_buf = Default::default();
 
             loop {
-                while packet_bufs.len() < max_number_of_packets {
-                    packet_bufs.push_back(recv_pool.get());
-                }
-                let n_available_bufs = packet_bufs.len();
-
                 // Read packets from the socket.
                 // TODO: src in PacketBuf?
-                let Ok(num_packets) = udp_rx
+                let Ok(()) = udp_rx
                     .recv_many_from(
                         &mut recv_many_buf,
+                        &mut recv_pool,
                         &mut packet_bufs,
-                        &mut source_addrs[..n_available_bufs],
+                        &mut source_addrs[..],
                     )
                     .await
                 else {
@@ -108,9 +104,7 @@ impl BufferedUdpReceive {
                     return;
                 };
 
-                for (i, packet_buf) in packet_bufs.drain(..num_packets).enumerate() {
-                    let src = source_addrs[i];
-
+                for (packet_buf, &src) in packet_bufs.drain(..).zip(source_addrs.iter()) {
                     let Some(src) = src else {
                         log::trace!("recv_many_from returned packet with no src; ignoring");
                         continue;
