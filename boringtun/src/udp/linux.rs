@@ -114,7 +114,7 @@ impl UdpRecv for super::UdpSocket {
     type RecvManyBuf = RecvManyBuf;
 
     fn max_number_of_packets_to_recv(&self) -> usize {
-        100 * MAX_PACKET_COUNT
+        MAX_SEGMENTS * MAX_PACKET_COUNT
     }
 
     async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
