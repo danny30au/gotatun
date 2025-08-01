@@ -118,8 +118,11 @@ impl UdpRecv for super::UdpSocket {
         MAX_SEGMENTS * MAX_PACKET_COUNT
     }
 
-    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        tokio::net::UdpSocket::recv_from(&self.inner, buf).await
+    async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        let mut buf = pool.get();
+        let (n, src) = self.inner.recv_from(&mut buf).await?;
+        buf.truncate(n);
+        Ok((buf, src))
     }
 
     async fn recv_many_from(

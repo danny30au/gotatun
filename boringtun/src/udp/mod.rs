@@ -56,8 +56,8 @@ pub trait UdpRecv: Send + Sync {
     /// Receive a single UDP packet.
     fn recv_from(
         &mut self,
-        buf: &mut [u8],
-    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
+        pool: &mut PacketBufPool,
+    ) -> impl Future<Output = io::Result<(Packet, SocketAddr)>> + Send;
 
     /// Receive up to `x` packets at once,
     /// where `x` is [UdpTransport::max_number_of_packets_to_recv].
