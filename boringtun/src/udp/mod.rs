@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::Future,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -71,10 +72,11 @@ pub trait UdpRecv: Send + Sync {
     fn recv_many_from(
         &mut self,
         _recv_buf: &mut Self::RecvManyBuf,
-        bufs: &mut [Packet],
+        bufs: &mut VecDeque<Packet>,
         source_addrs: &mut [Option<SocketAddr>],
     ) -> impl Future<Output = io::Result<usize>> + Send {
-        async {
+        async { todo!() }
+        /*async {
             let ([buf, ..], [source_addr_out, ..]) = (bufs, source_addrs) else {
                 return Ok(0);
             };
@@ -84,7 +86,7 @@ pub trait UdpRecv: Send + Sync {
             *source_addr_out = Some(source_addr);
 
             Ok(1)
-        }
+        }*/
     }
 }
 

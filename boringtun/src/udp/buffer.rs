@@ -1,5 +1,6 @@
 //! Generic buffered UdpTransport implementation.
 
+use std::collections::VecDeque;
 use std::iter;
 use std::{net::SocketAddr, sync::Arc};
 
@@ -82,14 +83,14 @@ impl BufferedUdpReceive {
 
         let recv_task = Task::spawn("buffered UDP receive", async move {
             let max_number_of_packets = udp_rx.max_number_of_packets_to_recv();
-            let mut packet_bufs = Vec::with_capacity(max_number_of_packets);
+            let mut packet_bufs = VecDeque::with_capacity(max_number_of_packets);
             let mut source_addrs = vec![None; max_number_of_packets];
 
             let mut recv_many_buf = Default::default();
 
             loop {
                 while packet_bufs.len() < max_number_of_packets {
-                    packet_bufs.push(recv_pool.get());
+                    packet_bufs.push_back(recv_pool.get());
                 }
                 let n_available_bufs = packet_bufs.len();
 
@@ -98,7 +99,7 @@ impl BufferedUdpReceive {
                 let Ok(num_packets) = udp_rx
                     .recv_many_from(
                         &mut recv_many_buf,
-                        &mut packet_bufs[..n_available_bufs],
+                        &mut packet_bufs,
                         &mut source_addrs[..n_available_bufs],
                     )
                     .await

@@ -6,6 +6,7 @@ use nix::{
     sys::socket::{ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrIn, SockaddrStorage},
 };
 use std::{
+    collections::VecDeque,
     io::{self, IoSlice, IoSliceMut},
     net::SocketAddr,
     os::fd::AsRawFd,
@@ -124,7 +125,7 @@ impl UdpRecv for super::UdpSocket {
     async fn recv_many_from(
         &mut self,
         recv_many_bufs: &mut Self::RecvManyBuf,
-        bufs: &mut [Packet],
+        bufs: &mut VecDeque<Packet>,
         source_addrs: &mut [Option<SocketAddr>],
     ) -> io::Result<usize> {
         debug_assert_eq!(bufs.len(), source_addrs.len());
