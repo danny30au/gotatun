@@ -5,9 +5,11 @@ use std::sync::Arc;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod tso;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod virtio;
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use tso::try_enable_tso;
+
+#[allow(dead_code)] // TODO
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod virtio;
 
 impl IpSend for Arc<::tun::AsyncDevice> {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
