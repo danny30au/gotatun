@@ -51,7 +51,7 @@ pub fn try_enable_tso(tun: &impl AsRawFd) -> io::Result<()> {
     [new_tso_iter_ipv4] [Ipv4] [Ipv4Header] [CoalescedIpv4];
     [new_tso_iter_ipv6] [Ipv6] [Ipv6Header] [CoalescedIpv6];
 )]
-pub fn new_tso_iter_ipvx(ipvx_packet: Packet<IpvX>, mtu: usize) -> io::Result<TsoIter> {
+pub fn new_tso_iter_ipvx(ipvx_packet: Packet<IpvX>, gso_size: usize) -> io::Result<TsoIter> {
     let packet_len = ipvx_packet.as_bytes().len();
 
     match ipvx_packet.header.next_protocol() {
@@ -60,7 +60,8 @@ pub fn new_tso_iter_ipvx(ipvx_packet: Packet<IpvX>, mtu: usize) -> io::Result<Ts
                 .try_into_tcp()
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
-            if packet_len > mtu {
+            // TODO: also check gso_type
+            if 0 < gso_size && gso_size < packet_len {
                 let tcp_options_len = tcp_packet
                     .payload
                     .options()
@@ -89,9 +90,10 @@ pub fn new_tso_iter_ipvx(ipvx_packet: Packet<IpvX>, mtu: usize) -> io::Result<Ts
                 let payload_len = packet_len - header_len;
 
                 // Target size of the segment payloads
-                let segment_payload_len = mtu
+                // TODO: does gso_size already exclude headers?
+                let segment_payload_len = gso_size
                     .checked_sub(header_len)
-                    .expect("MTU must be greater than the length of the IP/TCP headers");
+                    .unwrap_or_else(|| panic!("gso_size ({gso_size}) must be greater than the length of the IP/TCP headers ({header_len})"));
 
                 // We'll need this many segments
                 let segment_count = payload_len.div_ceil(segment_payload_len);
@@ -99,7 +101,7 @@ pub fn new_tso_iter_ipvx(ipvx_packet: Packet<IpvX>, mtu: usize) -> io::Result<Ts
                 // TODO: segmentation should not block the next tun.read
                 return Ok(TsoIter::CoalescedIpvX {
                     // TODO: consider using a pool
-                    buf: BytesMut::with_capacity((header_len + mtu) * segment_count),
+                    buf: BytesMut::with_capacity((header_len + gso_size) * segment_count),
                     segment_payload_len: segment_payload_len,
                     headers,
                     payload,

@@ -20,7 +20,9 @@ pub struct VirtioNetPacket<Payload: ?Sized> {
 ///
 /// Definition in linux include/uapi/linux/virtio_net.h
 #[repr(C, packed)]
-#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, PartialEq, Eq,
+)]
 pub struct VirtioNetHeader {
     pub flags: Flags,
 
