@@ -159,7 +159,7 @@ impl Tunn {
     /// # Panics
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
-    pub fn handle_outgoing_packet<'a>(&mut self, packet: Packet) -> TunnResult {
+    pub fn handle_outgoing_packet(&mut self, packet: Packet) -> TunnResult {
         let current = self.current;
 
         match self.encapsulate_with_session(packet, current) {
