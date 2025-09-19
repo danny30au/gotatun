@@ -14,7 +14,7 @@
 //! - Make encapsulation/decapsulation concurrent with IO.
 //!   The maybenot spec describes that outbound packet (i.e. those that have been received on the tunnel
 //!   interface but not yet sent on the network) can replace padding packets. However, currently there
-//!   are not `await`-points in `handle_outgoing` that would allow this to happen, I think.
+//!   are no `await`-points in `handle_outgoing` that would allow this to happen, I think.
 //!   Lacking the ability to replace padding packets with in-flight packets would be a regression
 //!   in comparison with the `wireguard-go` implementation. As far as I remember, this occurred quite
 //!   often, so it could be important for performance.
@@ -43,7 +43,7 @@ use std::{
 
 use crate::{
     noise::{self, TunnResult},
-    packet::{self, Ipv6Header, Packet},
+    packet::{self, Ipv6Header, Packet, Wg, WgPacketType},
     udp::UdpSend,
 };
 
@@ -122,6 +122,7 @@ impl DaitaHooks {
             udp_send: udp_send.clone(),
             tx_padding_packet_bytes: tx_padding_packet_bytes.clone(),
         };
+        // TODO abort on drop?
         tokio::spawn(daita.handle_events(event_rx));
         DaitaHooks {
             event_tx: event_tx.clone(),
@@ -136,22 +137,32 @@ impl DaitaHooks {
     }
 
     /// Should be called on outgoing data packets, before encapsulation
-    pub fn map_outgoing_data(&mut self, mut packet: Packet) -> Packet {
+    pub fn map_outgoing_data(&self, mut packet: Packet) -> Packet {
         let _ = self.event_tx.send(TriggerEvent::NormalSent);
         self.packet_count.inc_outbound(1);
 
         // Pad to constant size
         debug_assert!(packet.len() <= MTU as usize);
-        self.tx_padding_bytes += MTU as usize - packet.len();
+        // self.tx_padding_bytes += MTU as usize - packet.len(); // TODO
 
         packet.buf_mut().resize(MTU as usize, 0);
         packet
     }
 
-    /// Should be called on encapsulated *data* packets, before they are
-    /// send to the network. Should *not* be called on handshake a keepalive
-    /// packets, to prevent counters from drifting.
-    pub fn map_outgoing_encapsulated(&self, packet: Packet, addr: SocketAddr) -> Option<Packet> {
+    /// Should be called on packets, before they are sent to the network.
+    pub fn map_outgoing_encapsulated(
+        &self,
+        packet: Packet<Wg>,
+        addr: SocketAddr,
+    ) -> Option<Packet> {
+        let packet_type = packet.packet_type;
+        let packet = packet.into();
+
+        // DAITA only cares about data packets.
+        if packet_type != WgPacketType::Data {
+            return Some(packet);
+        }
+
         if let Ok(blocking) = self.blocking_state.try_read()
             && blocking.is_active()
         {
@@ -176,43 +187,43 @@ impl DaitaHooks {
     }
 
     /// Should be called on incoming validated encapsulated packets.
-    pub fn on_incoming_encapsulated<'a>(&self, packet: noise::Packet<'a>) {
-        if matches!(packet, noise::Packet::PacketData(_)) {
+    pub fn on_incoming_encapsulated(&self, packet: &noise::Packet<'_>) {
+        if let noise::Packet::PacketData(_) = packet {
             let _ = self.event_tx.send(TriggerEvent::TunnelRecv);
         }
     }
 
     /// Should be called on incoming decapsulated *data* packets.
-    pub fn map_incoming_data(&mut self, mut packet: Packet) -> Option<Packet> {
+    pub fn map_incoming_data(&self, mut packet: Packet) -> Option<Packet> {
         if let Ok(padding) = PaddingPacket::ref_from_bytes(packet.as_bytes())
             && padding.header._daita_marker == DAITA_MARKER
         {
             let _ = self.event_tx.send(TriggerEvent::PaddingRecv);
             // Count received padding
-            self.rx_padding_packet_bytes += u16::from(padding.header.length) as usize;
-            None
-        } else {
-            let ip_packet = packet::Ip::ref_from_bytes(packet.as_bytes()).ok()?;
-
-            let original_total_len = match ip_packet.header.version() {
-                4 => {
-                    let ipv4 = packet::Ipv4::<[u8]>::mut_from_bytes(packet.as_mut_bytes()).ok()?;
-                    usize::from(ipv4.header.total_len.get())
-                }
-                6 => {
-                    let ipv6 = packet::Ipv6::<[u8]>::mut_from_bytes(packet.as_mut_bytes()).ok()?;
-                    let payload_len = usize::from(ipv6.header.payload_length.get());
-                    payload_len + Ipv6Header::LEN
-                }
-                _ => return None,
-            };
-            debug_assert!(packet.len() >= original_total_len);
-            self.rx_padding_bytes += packet.len() - original_total_len;
-            packet.truncate(original_total_len);
-            let _ = self.event_tx.send(TriggerEvent::NormalRecv);
-
-            Some(packet)
+            // self.rx_padding_packet_bytes += u16::from(padding.header.length) as usize; // TODO
+            return None;
         }
+
+        let ip_packet = packet::Ip::ref_from_bytes(packet.as_bytes()).ok()?;
+
+        let original_total_len = match ip_packet.header.version() {
+            4 => {
+                let ipv4 = packet::Ipv4::<[u8]>::mut_from_bytes(packet.as_mut_bytes()).ok()?;
+                usize::from(ipv4.header.total_len.get())
+            }
+            6 => {
+                let ipv6 = packet::Ipv6::<[u8]>::mut_from_bytes(packet.as_mut_bytes()).ok()?;
+                let payload_len = usize::from(ipv6.header.payload_length.get());
+                payload_len + Ipv6Header::LEN
+            }
+            _ => return None,
+        };
+        debug_assert!(packet.len() >= original_total_len);
+        //self.rx_padding_bytes += packet.len() - original_total_len; // TODO
+        packet.truncate(original_total_len);
+        let _ = self.event_tx.send(TriggerEvent::NormalRecv);
+
+        Some(packet)
     }
 }
 
@@ -510,6 +521,7 @@ where
                             replace,
                             machine,
                         } => {
+                            // TODO: optimize for timeout==0?
                             machine_timers.insert_padding(*machine, *timeout, *replace, *bypass);
                         }
                         TriggerAction::BlockOutgoing {
@@ -519,6 +531,7 @@ where
                             replace,
                             machine,
                         } => {
+                            // TODO: optimize for timeout==0?
                             machine_timers
                                 .insert_block(*machine, *timeout, *duration, *replace, *bypass);
                         }
@@ -527,6 +540,7 @@ where
                             replace,
                             machine,
                         } => {
+                            // TODO: optimize for timeout==0?
                             if machine_timers.update_internal(*machine, *duration, *replace) {
                                 event_buf.push(TriggerEvent::TimerBegin { machine: *machine });
                             }

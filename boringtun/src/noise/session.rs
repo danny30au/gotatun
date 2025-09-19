@@ -1,8 +1,11 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::PacketData;
-use crate::noise::errors::WireGuardError;
+use crate::{
+    noise::errors::WireGuardError,
+    packet::{Packet, WgData},
+};
+use bytes::Buf;
 use parking_lot::Mutex;
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -235,36 +238,40 @@ impl Session {
     /// return the size of the encapsulated packet on success
     pub(super) fn receive_packet_data<'a>(
         &self,
-        packet: PacketData,
-        dst: &'a mut [u8],
-    ) -> Result<&'a mut [u8], WireGuardError> {
-        let ct_len = packet.encrypted_encapsulated_packet.len();
-        if dst.len() < ct_len {
-            // This is a very incorrect use of the library, therefore panic and not error
-            panic!("The destination buffer is too small");
-        }
+        mut packet: Packet<WgData>,
+    ) -> Result<Packet, WireGuardError> {
         if packet.receiver_idx != self.receiving_index {
             return Err(WireGuardError::WrongIndex);
         }
-        // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
-        self.receiving_counter_quick_check(packet.counter)?;
 
-        let ret = {
-            let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
-            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
-            self.receiver
-                .open_in_place(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut dst[..ct_len],
-                )
-                .map_err(|_| WireGuardError::InvalidAeadTag)?
-        };
+        let counter = packet.counter.get();
+
+        // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
+        self.receiving_counter_quick_check(counter)?;
+
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&packet.counter.to_bytes());
+
+        // decrypt the data in-place
+        let decrypted_len = self
+            .receiver
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(&[]),
+                &mut packet.encrypted_encapsulated_packet,
+            )
+            .map_err(|_| WireGuardError::InvalidAeadTag)?
+            .len();
+
+        // shift the packet buffer slice onto the decrypted data
+        let mut packet = packet.into_bytes();
+        let buf = packet.buf_mut();
+        buf.advance(16); // offset of WgData::encrypted_encapsulated_packet
+        buf.truncate(decrypted_len);
 
         // After decryption is done, check counter again, and mark as received
-        self.receiving_counter_mark(packet.counter)?;
-        Ok(ret)
+        self.receiving_counter_mark(counter)?;
+        Ok(packet)
     }
 
     /// Returns the estimated downstream packet loss for this session

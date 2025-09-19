@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
+//Bytes/ Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
 pub mod errors;
@@ -8,10 +8,13 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+use zerocopy::IntoBytes;
+
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
+use crate::packet::{Ipv4, Ipv6, Wg, WgData, WgKind};
 use crate::x25519;
 
 use std::collections::VecDeque;
@@ -46,8 +49,8 @@ pub enum TunnResult<'a> {
     Done,
     Err(WireGuardError),
     WriteToNetwork(&'a mut [u8]),
-    WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
-    WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
+    WriteToTunnelV4(crate::packet::Packet<Ipv4>),
+    WriteToTunnelV6(crate::packet::Packet<Ipv6>),
 }
 
 impl<'a> From<WireGuardError> for TunnResult<'a> {
@@ -319,14 +322,14 @@ impl Tunn {
 
     pub(crate) fn handle_incoming_packet<'a>(
         &mut self,
-        packet: Packet,
+        packet: WgKind,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
         match packet {
-            Packet::HandshakeInit(p) => self.handle_handshake_init(p, dst),
-            Packet::HandshakeResponse(p) => self.handle_handshake_response(p, dst),
-            Packet::PacketCookieReply(p) => self.handle_cookie_reply(p),
-            Packet::PacketData(p) => self.handle_data(p, dst),
+            WgKind::HandshakeInit(p) => self.handle_handshake_init(p, dst),
+            WgKind::HandshakeResp(p) => self.handle_handshake_response(p, dst),
+            WgKind::CookieReply(p) => self.handle_cookie_reply(p),
+            WgKind::Data(p) => self.handle_data(p, dst),
         }
         .unwrap_or_else(TunnResult::from)
     }
@@ -415,15 +418,39 @@ impl Tunn {
     /// Decrypts a data packet, and stores the decapsulated packet in dst.
     fn handle_data<'a>(
         &mut self,
-        packet: PacketData,
-        dst: &'a mut [u8],
+        packet: crate::packet::Packet<WgData>,
     ) -> Result<TunnResult<'a>, WireGuardError> {
-        let decapsulated_packet = self.decapsulate_with_session(packet, dst)?;
+        let decapsulated_packet = self.decapsulate_with_session(packet)?;
 
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
 
     pub fn decapsulate_with_session<'a>(
+        &mut self,
+        packet: crate::packet::Packet<WgData>,
+    ) -> Result<crate::packet::Packet, WireGuardError> {
+        let r_idx = packet.receiver_idx as usize;
+        let idx = r_idx % N_SESSIONS;
+
+        // Get the (probably) right session
+        let decapsulated_packet = {
+            let session = self.sessions[idx].as_ref();
+            let session = session.ok_or_else(|| {
+                //log::trace!(message = "No current session available", remote_idx = r_idx);
+                log::trace!("No current session available: {r_idx}");
+                WireGuardError::NoCurrentSession
+            })?;
+            session.receive_packet_data(packet, dst)?
+        };
+
+        self.set_current_session(r_idx);
+
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+
+        Ok(decapsulated_packet)
+    }
+
+    pub fn decapsulate_with_session_old<'a>(
         &mut self,
         packet: PacketData<'_>,
         dst: &'a mut [u8],
@@ -483,48 +510,26 @@ impl Tunn {
     // TODO: Use our zero-copy packet abstraction [crate::packet::Packet]
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
     /// Returns the truncated packet and the source IP as TunnResult
-    pub fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
-        let (computed_len, src_ip_address) = match packet.len() {
-            0 => return TunnResult::Done, // This is keepalive, and not an error
-            _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
-                let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
-                    .try_into()
-                    .unwrap();
-                let addr_bytes: [u8; IPV4_IP_SZ] = packet
-                    [IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ]
-                    .try_into()
-                    .unwrap();
-                (
-                    u16::from_be_bytes(len_bytes) as usize,
-                    IpAddr::from(addr_bytes),
-                )
-            }
-            _ if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => {
-                let len_bytes: [u8; IP_LEN_SZ] = packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ]
-                    .try_into()
-                    .unwrap();
-                let addr_bytes: [u8; IPV6_IP_SZ] = packet
-                    [IPV6_SRC_IP_OFF..IPV6_SRC_IP_OFF + IPV6_IP_SZ]
-                    .try_into()
-                    .unwrap();
-                (
-                    u16::from_be_bytes(len_bytes) as usize + IPV6_MIN_HEADER_SIZE,
-                    IpAddr::from(addr_bytes),
-                )
-            }
-            _ => return TunnResult::Err(WireGuardError::InvalidPacket),
+    pub fn validate_decapsulated_packet<'a>(
+        &mut self,
+        packet: crate::packet::Packet,
+    ) -> TunnResult<'a> {
+        // TODO: truncate packet to ip_len
+        let Ok(packet) = packet.try_into_ipvx() else {
+            return TunnResult::Err(WireGuardError::InvalidPacket);
         };
 
-        if computed_len > packet.len() {
-            return TunnResult::Err(WireGuardError::InvalidPacket);
-        }
-
         self.timer_tick(TimerName::TimeLastDataPacketReceived);
-        self.rx_bytes += computed_len; // TODO: Should we instead add `packet.len()`, see discussion on symmetrical counters
 
-        match src_ip_address {
-            IpAddr::V4(addr) => TunnResult::WriteToTunnelV4(&mut packet[..computed_len], addr),
-            IpAddr::V6(addr) => TunnResult::WriteToTunnelV6(&mut packet[..computed_len], addr),
+        match packet {
+            either::Either::Left(ipv4) => {
+                self.rx_bytes += ipv4.as_bytes().len(); // TODO: Should we instead add length before truncating? see discussion on symmetrical counters
+                TunnResult::WriteToTunnelV4(ipv4)
+            }
+            either::Either::Right(ipv6) => {
+                self.rx_bytes += ipv6.as_bytes().len(); // TODO: Should we instead add length before truncating? see discussion on symmetrical counters
+                TunnResult::WriteToTunnelV6(ipv6)
+            }
         }
     }
 

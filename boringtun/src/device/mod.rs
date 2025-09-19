@@ -7,6 +7,7 @@ pub mod api;
 pub mod daita;
 #[cfg(unix)]
 pub mod drop_privileges;
+pub mod hooks;
 #[cfg(test)]
 mod integration_tests;
 pub mod peer;
@@ -22,6 +23,7 @@ use tokio::join;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
+use crate::device::daita::DaitaHooks;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -138,12 +140,17 @@ pub struct Device<T: DeviceTransports> {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
+    daita: Option<Arc<Mutex<DaitaHooks>>>,
+
     port: u16,
     udp_factory: T::UdpTransportFactory,
     connection: Option<Connection<T>>,
 
     /// The task that responds to API requests.
     api: Option<Task>,
+
+    // FIXME
+    hooks: Arc<DaitaHooks>,
 }
 
 pub(crate) struct Connection<T: DeviceTransports> {
@@ -620,6 +627,14 @@ impl<T: DeviceTransports> Device<T> {
             let rate_limiter = device.rate_limiter.clone().unwrap();
             (private_key, public_key, rate_limiter)
         };
+        let hooks = {
+            let Some(device) = device.upgrade() else {
+                return Ok(());
+            };
+
+            let device = device.read().await;
+            device.hooks.clone()
+        };
 
         while let Ok((src_buf, addr)) = udp_rx.recv_from(&mut packet_pool).await {
             let mut dst_buf = packet_pool.get();
@@ -638,6 +653,8 @@ impl<T: DeviceTransports> Device<T> {
                     }
                     Err(_) => continue,
                 };
+
+            hooks.on_incoming_encapsulated(&parsed_packet);
 
             let Some(device) = device.upgrade() else {
                 return Ok(());
@@ -658,6 +675,7 @@ impl<T: DeviceTransports> Device<T> {
                 continue;
             };
             let mut peer = peer.lock().await;
+
             match peer
                 .tunnel
                 .handle_incoming_packet(parsed_packet, &mut dst_buf[..])
@@ -693,18 +711,28 @@ impl<T: DeviceTransports> Device<T> {
                         }
                     }
                 }
-                TunnResult::WriteToTunnelV4(packet, addr) => {
-                    let len = packet.len();
-                    dst_buf.truncate(len); // hacky but works
-                    let Ok(dst_buf) = dst_buf.try_into_ip() else {
+                TunnResult::WriteToTunnelV4(packet_lol, addr) => {
+                    let packet = {
+                        let len = packet_lol.len();
+                        dst_buf.truncate(len); // hacky but works
+                        dst_buf
+                    };
+                    packet_lol;
+
+                    let Ok(packet) = packet.try_into_ip() else {
                         log::trace!("Invalid packet");
                         continue;
                     };
-                    if peer.is_allowed_ip(addr)
-                        && let Err(_err) = tun_tx.send(dst_buf).await
-                    {
-                        log::trace!("buffered_tun_send.send failed");
-                        break;
+
+                    if peer.is_allowed_ip(addr) {
+                        let Some(packet) = hooks.map_incoming_data(packet) else {
+                            continue;
+                        }
+
+                        if let Err(_err) = tun_tx.send(packet).await {
+                            log::trace!("buffered_tun_send.send failed");
+                            break;
+                        }
                     }
                 }
                 TunnResult::WriteToTunnelV6(packet, addr) => {
@@ -735,6 +763,15 @@ impl<T: DeviceTransports> Device<T> {
         udp6: impl UdpSend,
         mut packet_pool: PacketBufPool,
     ) {
+        let hooks = {
+            let Some(device) = device.upgrade() else {
+                return;
+            };
+
+            let device = device.read().await;
+            device.hooks.clone()
+        };
+
         loop {
             let packets = match tun_rx.recv(&mut packet_pool).await {
                 Ok(packets) => packets,
@@ -749,39 +786,62 @@ impl<T: DeviceTransports> Device<T> {
                 let Some(dst_addr) = packet.destination() else {
                     continue;
                 };
+
+                let packet = packet.into_bytes();
+                let packet = hooks.map_outgoing_data(packet);
+
                 let Some(device) = device.upgrade() else {
                     return;
                 };
-                let peers = &device.read().await.peers_by_ip;
-                let mut peer = match peers.find(dst_addr) {
-                    Some(peer) => peer.lock().await,
-                    // Drop packet if no peer has allowed IPs for destination
-                    None => continue,
+
+                let peer = {
+                    let device = device.read().await;
+                    let Some(peer) = device.peers_by_ip.find(dst_addr).cloned() else {
+                        // Drop packet if no peer has allowed IPs for destination
+                        continue;
+                    };
+                    peer
+                };
+
+                let mut peer = peer.lock().await;
+                let Some(peer_addr) = peer.endpoint().addr else {
+                    log::error!("No endpoint");
+                    continue;
                 };
 
                 let mut dst_buf = packet_pool.get();
-                match peer
+
+                let tunn_result = peer
                     .tunnel
-                    .handle_outgoing_packet(&packet.into_bytes(), &mut dst_buf[..])
-                {
+                    .handle_outgoing_packet(&packet, &mut dst_buf[..]);
+
+                drop(peer); // release lock
+
+                match tunn_result {
                     TunnResult::Done => {}
                     TunnResult::Err(e) => {
-                        log::error!("Encapsulate error={e:?}: {e:?}");
+                        log::error!("Encapsulate error: {e:?}");
                     }
                     TunnResult::WriteToNetwork(packet) => {
-                        let len = packet.len();
-                        dst_buf.truncate(len);
-                        let endpoint_addr = peer.endpoint().addr;
-                        if let Some(SocketAddr::V4(addr)) = endpoint_addr {
-                            if udp4.send_to(dst_buf, addr.into()).await.is_err() {
-                                break;
-                            }
-                        } else if let Some(SocketAddr::V6(addr)) = endpoint_addr {
-                            if udp6.send_to(dst_buf, addr.into()).await.is_err() {
-                                break;
-                            }
-                        } else {
-                            log::error!("No endpoint");
+                        // FIXME: this is awful
+                        let packet = {
+                            let len = packet.len();
+                            dst_buf.truncate(len);
+                            dst_buf.try_into_wg().unwrap()
+                        };
+
+                        let Some(packet) = hooks.map_outgoing_encapsulated(packet, peer_addr)
+                        else {
+                            continue;
+                        };
+
+                        let result = match peer_addr {
+                            SocketAddr::V4(..) => udp4.send_to(packet.into(), peer_addr).await,
+                            SocketAddr::V6(..) => udp6.send_to(packet.into(), peer_addr).await,
+                        };
+
+                        if result.is_err() {
+                            break;
                         }
                     }
                     _ => panic!("Unexpected result from encapsulate"),
