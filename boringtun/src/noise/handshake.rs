@@ -1,7 +1,6 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{HandshakeInit, HandshakeResponse, PacketCookieReply};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
 use crate::packet::{Packet, WgCookieReply, WgHandshakeInit, WgHandshakeResp};
@@ -331,16 +330,16 @@ pub struct HalfHandshake {
 pub fn parse_handshake_anon(
     static_private: &x25519::StaticSecret,
     static_public: &x25519::PublicKey,
-    packet: &HandshakeInit,
+    packet: &WgHandshakeInit,
 ) -> Result<HalfHandshake, WireGuardError> {
-    let peer_index = packet.sender_idx;
+    let peer_index = packet.sender_idx.get();
     // initiator.chaining_key = HASH(CONSTRUCTION)
     let mut chaining_key = INITIAL_CHAIN_KEY;
     // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
     let mut hash = INITIAL_CHAIN_HASH;
     hash = b2s_hash(&hash, static_public.as_bytes());
     // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
-    let peer_ephemeral_public = x25519::PublicKey::from(*packet.unencrypted_ephemeral);
+    let peer_ephemeral_public = x25519::PublicKey::from(packet.unencrypted_ephemeral);
     // initiator.hash = HASH(initiator.hash || msg.unencrypted_ephemeral)
     hash = b2s_hash(&hash, peer_ephemeral_public.as_bytes());
     // temp = HMAC(initiator.chaining_key, msg.unencrypted_ephemeral)
@@ -363,7 +362,7 @@ pub fn parse_handshake_anon(
         &mut peer_static_public,
         &key,
         0,
-        packet.encrypted_static,
+        &packet.encrypted_static,
         &hash,
     )?;
 
