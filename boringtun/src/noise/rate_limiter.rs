@@ -1,14 +1,14 @@
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
-use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
-use crate::packet::{Wg, WgCookieReply, WgKind};
+use crate::noise::{TunnResult, WireGuardError};
+use crate::packet::{Packet, Wg, WgCookieReply, WgKind};
 
 use constant_time_eq::constant_time_eq;
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use zerocopy::{FromZeros, IntoBytes};
+use zerocopy::IntoBytes;
 
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
@@ -147,11 +147,11 @@ impl RateLimiter {
     pub fn verify_packet<'a, 'b>(
         &self,
         src_addr: Option<IpAddr>,
-        packet: crate::packet::Packet,
-    ) -> Result<crate::packet::WgKind, TunnResult> {
+        packet: Packet,
+    ) -> Result<WgKind, TunnResult> {
         let parsed_packet = packet
             .try_into_wg()
-            .and_then(crate::packet::Packet::<Wg>::into_kind)
+            .and_then(Packet::<Wg>::into_kind)
             // TODO: right error?
             .map_err(|_err| TunnResult::Err(WireGuardError::InvalidPacket))?;
 
@@ -184,8 +184,7 @@ impl RateLimiter {
                 let cookie_reply = self
                     .format_cookie_reply(sender_idx.get(), cookie, mac1)
                     .map_err(TunnResult::Err)?;
-                let packet =
-                    crate::packet::Packet::from(parsed_packet).overwrite_with(&cookie_reply);
+                let packet = Packet::from(parsed_packet).overwrite_with(&cookie_reply);
                 return Err(TunnResult::WriteToNetwork(packet.into()));
             }
         }

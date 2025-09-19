@@ -143,8 +143,7 @@ const DATA_OVERHEAD_SZ: usize = 32;
 impl Packet {
     /// Convert into a wireguard packet while sanity-checking packet type and size.
     pub fn try_into_wg(self) -> eyre::Result<Packet<Wg>> {
-        let len = self.len();
-        let wg = Wg::ref_from_bytes(self.as_bytes())
+        let _wg = Wg::ref_from_bytes(self.as_bytes())
             .map_err(|_| eyre!("Not a wireguard packet, too small."))?;
 
         Ok(self.cast())

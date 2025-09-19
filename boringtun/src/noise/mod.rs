@@ -8,7 +8,6 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
-use bytes::BytesMut;
 use zerocopy::IntoBytes;
 
 use crate::noise::errors::WireGuardError;
@@ -16,13 +15,13 @@ use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 use crate::packet::{
-    Ipv4, Ipv6, Wg, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind,
+    Ipv4, Ipv6, Packet, Wg, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind,
 };
 use crate::x25519;
 
 use std::collections::VecDeque;
-use std::convert::{TryFrom, TryInto};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::convert::TryInto;
+use std::net::IpAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,18 +30,12 @@ use std::time::Duration;
 const PEER_HANDSHAKE_RATE_LIMIT: u64 = 10;
 
 const IPV4_MIN_HEADER_SIZE: usize = 20;
-const IPV4_LEN_OFF: usize = 2;
-const IPV4_SRC_IP_OFF: usize = 12;
 const IPV4_DST_IP_OFF: usize = 16;
 const IPV4_IP_SZ: usize = 4;
 
 const IPV6_MIN_HEADER_SIZE: usize = 40;
-const IPV6_LEN_OFF: usize = 4;
-const IPV6_SRC_IP_OFF: usize = 8;
 const IPV6_DST_IP_OFF: usize = 24;
 const IPV6_IP_SZ: usize = 16;
-
-const IP_LEN_SZ: usize = 2;
 
 const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
@@ -52,9 +45,9 @@ const N_SESSIONS: usize = 8;
 pub enum TunnResult {
     Done,
     Err(WireGuardError),
-    WriteToNetwork(crate::packet::Packet<Wg>),
-    WriteToTunnelV4(crate::packet::Packet<Ipv4>),
-    WriteToTunnelV6(crate::packet::Packet<Ipv6>),
+    WriteToNetwork(Packet<Wg>),
+    WriteToTunnelV4(Packet<Ipv4>),
+    WriteToTunnelV6(Packet<Ipv6>),
 }
 
 impl From<WireGuardError> for TunnResult {
@@ -72,7 +65,7 @@ pub struct Tunn {
     /// Index of most recently used session
     current: usize,
     /// Queue to store blocked packets
-    packet_queue: VecDeque<crate::packet::Packet>,
+    packet_queue: VecDeque<Packet>,
     /// Keeps tabs on the expiring timers
     timers: timers::Timers,
     tx_bytes: usize,
@@ -80,95 +73,7 @@ pub struct Tunn {
     rate_limiter: Arc<RateLimiter>,
 }
 
-type MessageType = u32;
-const HANDSHAKE_INIT: MessageType = 1;
-const HANDSHAKE_RESP: MessageType = 2;
-const COOKIE_REPLY: MessageType = 3;
-const DATA: MessageType = 4;
-
-const HANDSHAKE_INIT_SZ: usize = 148;
-const HANDSHAKE_RESP_SZ: usize = 92;
-const COOKIE_REPLY_SZ: usize = 64;
-const DATA_OVERHEAD_SZ: usize = 32;
-
-#[derive(Debug)]
-pub struct HandshakeInit<'a> {
-    sender_idx: u32,
-    unencrypted_ephemeral: &'a [u8; 32],
-    encrypted_static: &'a [u8],
-    encrypted_timestamp: &'a [u8],
-}
-
-#[derive(Debug)]
-pub struct HandshakeResponse<'a> {
-    sender_idx: u32,
-    pub receiver_idx: u32,
-    unencrypted_ephemeral: &'a [u8; 32],
-    encrypted_nothing: &'a [u8],
-}
-
-#[derive(Debug)]
-pub struct PacketCookieReply<'a> {
-    pub receiver_idx: u32,
-    nonce: &'a [u8],
-    encrypted_cookie: &'a [u8],
-}
-
-#[derive(Debug)]
-pub struct PacketData<'a> {
-    pub receiver_idx: u32,
-    counter: u64,
-    encrypted_encapsulated_packet: &'a [u8],
-}
-
-/// Describes a packet from network
-#[derive(Debug)]
-pub enum Packet<'a> {
-    HandshakeInit(HandshakeInit<'a>),
-    HandshakeResponse(HandshakeResponse<'a>),
-    PacketCookieReply(PacketCookieReply<'a>),
-    PacketData(PacketData<'a>),
-}
-
 impl Tunn {
-    #[inline(always)]
-    pub fn parse_incoming_packet(src: &'_ [u8]) -> Result<Packet<'_>, WireGuardError> {
-        if src.len() < 4 {
-            return Err(WireGuardError::InvalidPacket);
-        }
-
-        // Checks the type, as well as the reserved zero fields
-        let packet_type = u32::from_le_bytes(src[0..4].try_into().unwrap());
-
-        Ok(match (packet_type, src.len()) {
-            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
-                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
-                    .expect("length already checked above"),
-                encrypted_static: &src[40..88],
-                encrypted_timestamp: &src[88..116],
-            }),
-            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
-                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
-                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
-                    .expect("length already checked above"),
-                encrypted_nothing: &src[44..60],
-            }),
-            (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
-                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                nonce: &src[8..32],
-                encrypted_cookie: &src[32..64],
-            }),
-            (DATA, DATA_OVERHEAD_SZ..=usize::MAX) => Packet::PacketData(PacketData {
-                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
-                encrypted_encapsulated_packet: &src[16..],
-            }),
-            _ => return Err(WireGuardError::InvalidPacket),
-        })
-    }
-
     pub fn is_expired(&self) -> bool {
         self.handshake.is_expired()
     }
@@ -254,7 +159,7 @@ impl Tunn {
     /// # Panics
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
-    pub fn handle_outgoing_packet<'a>(&mut self, packet: crate::packet::Packet) -> TunnResult {
+    pub fn handle_outgoing_packet<'a>(&mut self, packet: Packet) -> TunnResult {
         let current = self.current;
 
         match self.encapsulate_with_session(packet, current) {
@@ -270,9 +175,9 @@ impl Tunn {
 
     fn encapsulate_with_session<'a>(
         &mut self,
-        packet: crate::packet::Packet,
+        packet: Packet,
         current: usize,
-    ) -> Result<crate::packet::Packet<Wg>, crate::packet::Packet> {
+    ) -> Result<Packet<Wg>, Packet> {
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
             let packet = session.format_packet_data(packet);
@@ -337,7 +242,7 @@ impl Tunn {
 
     fn handle_handshake_init(
         &mut self,
-        p: crate::packet::Packet<WgHandshakeInit>,
+        p: Packet<WgHandshakeInit>,
     ) -> Result<TunnResult, WireGuardError> {
         log::debug!("Received handshake_initiation: {}", p.sender_idx);
 
@@ -358,7 +263,7 @@ impl Tunn {
 
     fn handle_handshake_response<'a>(
         &mut self,
-        p: crate::packet::Packet<WgHandshakeResp>,
+        p: Packet<WgHandshakeResp>,
     ) -> Result<TunnResult, WireGuardError> {
         log::debug!(
             "Received handshake_response: {} {}",
@@ -415,10 +320,7 @@ impl Tunn {
     }
 
     /// Decrypts a data packet, and stores the decapsulated packet in dst.
-    fn handle_data(
-        &mut self,
-        packet: crate::packet::Packet<WgData>,
-    ) -> Result<TunnResult, WireGuardError> {
+    fn handle_data(&mut self, packet: Packet<WgData>) -> Result<TunnResult, WireGuardError> {
         let decapsulated_packet = self.decapsulate_with_session(packet)?;
 
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
@@ -426,8 +328,8 @@ impl Tunn {
 
     pub fn decapsulate_with_session<'a>(
         &mut self,
-        packet: crate::packet::Packet<WgData>,
-    ) -> Result<crate::packet::Packet, WireGuardError> {
+        packet: Packet<WgData>,
+    ) -> Result<Packet, WireGuardError> {
         let r_idx = packet.receiver_idx.get() as usize;
         let idx = r_idx % N_SESSIONS;
 
@@ -479,7 +381,7 @@ impl Tunn {
     // TODO: Use our zero-copy packet abstraction [crate::packet::Packet]
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
     /// Returns the truncated packet and the source IP as TunnResult
-    pub fn validate_decapsulated_packet(&mut self, packet: crate::packet::Packet) -> TunnResult {
+    pub fn validate_decapsulated_packet(&mut self, packet: Packet) -> TunnResult {
         // TODO: truncate packet to ip_len
         let Ok(packet) = packet.try_into_ipvx() else {
             return TunnResult::Err(WireGuardError::InvalidPacket);
@@ -502,7 +404,7 @@ impl Tunn {
     /// Get a packet from the queue, and try to encapsulate it
     pub fn send_queued_packet(&mut self) -> TunnResult {
         if let Some(packet) = self.dequeue_packet() {
-            let packet2 = crate::packet::Packet::copy_from(packet.deref());
+            let packet2 = Packet::copy_from(packet.deref());
             match self.handle_outgoing_packet(packet) {
                 TunnResult::Err(_) => {
                     // On error, return packet to the queue
@@ -515,7 +417,7 @@ impl Tunn {
     }
 
     /// Push packet to the back of the queue
-    fn queue_packet(&mut self, packet: crate::packet::Packet) {
+    fn queue_packet(&mut self, packet: Packet) {
         if self.packet_queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
             self.packet_queue.push_back(packet);
@@ -523,14 +425,14 @@ impl Tunn {
     }
 
     /// Push packet to the front of the queue
-    fn requeue_packet(&mut self, packet: crate::packet::Packet) {
+    fn requeue_packet(&mut self, packet: Packet) {
         if self.packet_queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
             self.packet_queue.push_front(packet);
         }
     }
 
-    fn dequeue_packet(&mut self) -> Option<crate::packet::Packet> {
+    fn dequeue_packet(&mut self) -> Option<Packet> {
         self.packet_queue.pop_front()
     }
 

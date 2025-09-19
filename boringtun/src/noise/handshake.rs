@@ -10,7 +10,6 @@ use crate::x25519;
 use aead::{Aead, Payload};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use bytes::BytesMut;
 use chacha20poly1305::XChaCha20Poly1305;
 use constant_time_eq::constant_time_eq_n;
 use rand_core::OsRng;
