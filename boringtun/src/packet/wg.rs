@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug};
 
 use eyre::{bail, eyre};
-use zerocopy::{little_endian, FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned, little_endian};
 
 use crate::packet::Packet;
 
@@ -14,7 +14,9 @@ pub struct Wg {
 
 impl Debug for Wg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Wg").field("packet_type", &self.packet_type).finish()
+        f.debug_struct("Wg")
+            .field("packet_type", &self.packet_type)
+            .finish()
     }
 }
 
@@ -23,6 +25,17 @@ pub enum WgKind {
     HandshakeResp(Packet<WgHandshakeResp>),
     CookieReply(Packet<WgCookieReply>),
     Data(Packet<WgData>),
+}
+
+impl From<WgKind> for Packet {
+    fn from(kind: WgKind) -> Self {
+        match kind {
+            WgKind::HandshakeInit(packet) => packet.into(),
+            WgKind::HandshakeResp(packet) => packet.into(),
+            WgKind::CookieReply(packet) => packet.into(),
+            WgKind::Data(packet) => packet.into(),
+        }
+    }
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, PartialEq, Eq, Clone, Copy)]
@@ -88,11 +101,7 @@ pub struct WgHandshakeResp {
 }
 
 impl WgHandshakeResp {
-    pub fn new(
-        sender_idx: u32,
-        receiver_idx: u32,
-        unencrypted_ephemeral: [u8; 32],
-    ) -> Self {
+    pub fn new(sender_idx: u32, receiver_idx: u32, unencrypted_ephemeral: [u8; 32]) -> Self {
         Self {
             packet_type: WgPacketType::HandshakeResp,
             sender_idx: sender_idx.into(),
@@ -114,6 +123,15 @@ pub struct WgCookieReply {
     pub receiver_idx: little_endian::U32,
     pub nonce: [u8; 24],
     pub encrypted_cookie: [u8; 32],
+}
+
+impl WgCookieReply {
+    pub fn new() -> Self {
+        Self {
+            packet_type: WgPacketType::CookieReply,
+            ..Self::new_zeroed()
+        }
+    }
 }
 
 // TODO: DRY

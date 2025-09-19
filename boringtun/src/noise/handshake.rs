@@ -4,7 +4,7 @@
 use super::{HandshakeInit, HandshakeResponse, PacketCookieReply};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
-use crate::packet::{Packet, WgHandshakeInit, WgHandshakeResp};
+use crate::packet::{Packet, WgCookieReply, WgHandshakeInit, WgHandshakeResp};
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
@@ -569,19 +569,23 @@ impl Handshake {
 
     pub(super) fn receive_handshake_response(
         &mut self,
-        packet: HandshakeResponse,
+        packet: &WgHandshakeResp,
     ) -> Result<Session, WireGuardError> {
         // Check if there is a handshake awaiting a response and return the correct one
         let (state, is_previous) = match (&self.state, &self.previous) {
-            (HandshakeState::InitSent(s), _) if s.local_index == packet.receiver_idx => (s, false),
-            (_, HandshakeState::InitSent(s)) if s.local_index == packet.receiver_idx => (s, true),
+            (HandshakeState::InitSent(s), _) if s.local_index == packet.receiver_idx.get() => {
+                (s, false)
+            }
+            (_, HandshakeState::InitSent(s)) if s.local_index == packet.receiver_idx.get() => {
+                (s, true)
+            }
             _ => return Err(WireGuardError::UnexpectedPacket),
         };
 
         let peer_index = packet.sender_idx;
         let local_index = state.local_index;
 
-        let unencrypted_ephemeral = x25519::PublicKey::from(*packet.unencrypted_ephemeral);
+        let unencrypted_ephemeral = x25519::PublicKey::from(packet.unencrypted_ephemeral);
         // msg.unencrypted_ephemeral = DH_PUBKEY(responder.ephemeral_private)
         // responder.hash = HASH(responder.hash || msg.unencrypted_ephemeral)
         let mut hash = b2s_hash(&state.hash, unencrypted_ephemeral.as_bytes());
@@ -621,7 +625,7 @@ impl Handshake {
         // responder.hash = HASH(responder.hash || temp2)
         hash = b2s_hash(&hash, &temp2);
         // msg.encrypted_nothing = AEAD(key, 0, [empty], responder.hash)
-        aead_chacha20_open(&mut [], &key, 0, packet.encrypted_nothing, &hash)?;
+        aead_chacha20_open(&mut [], &key, 0, &packet.encrypted_nothing, &hash)?;
 
         // responder.hash = HASH(responder.hash || msg.encrypted_nothing)
         // hash = b2s_hash(hash, buf[ENC_NOTHING_OFF..ENC_NOTHING_OFF + ENC_NOTHING_SZ]);
@@ -646,12 +650,12 @@ impl Handshake {
         } else {
             self.state = HandshakeState::None;
         }
-        Ok(Session::new(local_index, peer_index, temp3, temp2))
+        Ok(Session::new(local_index, peer_index.get(), temp3, temp2))
     }
 
     pub(super) fn receive_cookie_reply(
         &mut self,
-        packet: PacketCookieReply,
+        packet: &WgCookieReply,
     ) -> Result<(), WireGuardError> {
         let mac1 = match self.cookies.last_mac1 {
             Some(mac) => mac,
@@ -669,11 +673,11 @@ impl Handshake {
 
         let payload = Payload {
             aad: &mac1[0..16],
-            msg: packet.encrypted_cookie,
+            msg: &packet.encrypted_cookie,
         };
         let plaintext = XChaCha20Poly1305::new_from_slice(&key)
             .unwrap()
-            .decrypt(packet.nonce.into(), payload)
+            .decrypt(&packet.nonce.into(), payload)
             .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
         let cookie = plaintext

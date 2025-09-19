@@ -197,7 +197,7 @@ impl Session {
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, packet: Packet) -> Packet<Wg> {
+    pub(super) fn format_packet_data(&self, packet: Packet) -> Packet<Wg> {
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
         let len = DATA_OFFSET + AEAD_SIZE + packet.len();

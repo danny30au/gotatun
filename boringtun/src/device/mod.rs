@@ -639,20 +639,19 @@ impl<T: DeviceTransports> Device<T> {
         while let Ok((src_buf, addr)) = udp_rx.recv_from(&mut packet_pool).await {
             let mut dst_buf = packet_pool.get();
 
-            let parsed_packet =
-                match rate_limiter.verify_packet(Some(addr.ip()), &src_buf, &mut dst_buf[..]) {
-                    Ok(packet) => packet,
-                    Err(TunnResult::WriteToNetwork(cookie)) => {
-                        let len = cookie.len();
-                        dst_buf.truncate(len);
-                        if let Err(_err) = udp_tx.send_to(dst_buf, addr).await {
-                            log::trace!("udp.send_to failed");
-                            break;
-                        }
-                        continue;
+            let parsed_packet = match rate_limiter.verify_packet(Some(addr.ip()), &src_buf) {
+                Ok(packet) => packet,
+                Err(TunnResult::WriteToNetwork(cookie)) => {
+                    let len = cookie.len();
+                    dst_buf.truncate(len);
+                    if let Err(_err) = udp_tx.send_to(dst_buf, addr).await {
+                        log::trace!("udp.send_to failed");
+                        break;
                     }
-                    Err(_) => continue,
-                };
+                    continue;
+                }
+                Err(_) => continue,
+            };
 
             hooks.on_incoming_encapsulated(&parsed_packet);
 

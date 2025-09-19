@@ -15,12 +15,15 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
-use crate::packet::{Ipv4, Ipv6, Wg, WgData, WgHandshakeInit, WgKind};
+use crate::packet::{
+    Ipv4, Ipv6, Wg, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind,
+};
 use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -322,20 +325,20 @@ impl Tunn {
     }
     */
 
-    pub(crate) fn handle_incoming_packet<'a>(&mut self, packet: WgKind) -> TunnResult<'a> {
+    pub(crate) fn handle_incoming_packet(&mut self, packet: WgKind) -> TunnResult {
         match packet {
             WgKind::HandshakeInit(p) => self.handle_handshake_init(p),
             WgKind::HandshakeResp(p) => self.handle_handshake_response(p),
-            WgKind::CookieReply(p) => self.handle_cookie_reply(p),
+            WgKind::CookieReply(p) => self.handle_cookie_reply(&p),
             WgKind::Data(p) => self.handle_data(p),
         }
         .unwrap_or_else(TunnResult::from)
     }
 
-    fn handle_handshake_init<'a>(
+    fn handle_handshake_init(
         &mut self,
         p: crate::packet::Packet<WgHandshakeInit>,
-    ) -> Result<TunnResult<'a>, WireGuardError> {
+    ) -> Result<TunnResult, WireGuardError> {
         log::debug!("Received handshake_initiation: {}", p.sender_idx);
 
         let (packet, session) = self.handshake.receive_handshake_initialization(p)?;
@@ -350,22 +353,25 @@ impl Tunn {
 
         log::debug!("Sending handshake_response: {index}");
 
-        Ok(TunnResult::WriteToNetwork(packet))
+        Ok(TunnResult::WriteToNetwork(packet.into()))
     }
 
     fn handle_handshake_response<'a>(
         &mut self,
-        p: HandshakeResponse,
-    ) -> Result<TunnResult<'a>, WireGuardError> {
+        p: crate::packet::Packet<WgHandshakeResp>,
+    ) -> Result<TunnResult, WireGuardError> {
         log::debug!(
             "Received handshake_response: {} {}",
             p.receiver_idx,
             p.sender_idx,
         );
 
-        let session = self.handshake.receive_handshake_response(p)?;
+        let session = self.handshake.receive_handshake_response(&p)?;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let mut p = p.into_bytes();
+        p.truncate(0);
+
+        let keepalive_packet = session.format_packet_data(p);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -380,10 +386,7 @@ impl Tunn {
         Ok(TunnResult::WriteToNetwork(keepalive_packet)) // Send a keepalive as a response
     }
 
-    fn handle_cookie_reply<'a>(
-        &mut self,
-        p: PacketCookieReply,
-    ) -> Result<TunnResult<'a>, WireGuardError> {
+    fn handle_cookie_reply(&mut self, p: &WgCookieReply) -> Result<TunnResult, WireGuardError> {
         log::debug!("Received cookie_reply: {}", p.receiver_idx);
 
         self.handshake.receive_cookie_reply(p)?;
@@ -412,10 +415,10 @@ impl Tunn {
     }
 
     /// Decrypts a data packet, and stores the decapsulated packet in dst.
-    fn handle_data<'a>(
+    fn handle_data(
         &mut self,
         packet: crate::packet::Packet<WgData>,
-    ) -> Result<TunnResult<'a>, WireGuardError> {
+    ) -> Result<TunnResult, WireGuardError> {
         let decapsulated_packet = self.decapsulate_with_session(packet)?;
 
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
@@ -448,11 +451,7 @@ impl Tunn {
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
     /// a new handshake, even if a handshake is already in progress (for example when a handshake times out)
-    pub fn format_handshake_initiation<'a>(&mut self, force_resend: bool) -> TunnResult {
-        let len = WgHandshakeInit::new();
-        let mut buf =
-            crate::packet::Packet::from_bytes(BytesMut::zeroed(size_of::<WgHandshakeInit>()));
-
+    pub fn format_handshake_initiation(&mut self, force_resend: bool) -> TunnResult {
         if self.handshake.is_in_progress() && !force_resend {
             return TunnResult::Done;
         }
@@ -501,12 +500,13 @@ impl Tunn {
     }
 
     /// Get a packet from the queue, and try to encapsulate it
-    pub fn send_queued_packet(&mut self, packet: Packet) -> TunnResult {
+    pub fn send_queued_packet(&mut self) -> TunnResult {
         if let Some(packet) = self.dequeue_packet() {
+            let packet2 = crate::packet::Packet::copy_from(packet.deref());
             match self.handle_outgoing_packet(packet) {
                 TunnResult::Err(_) => {
                     // On error, return packet to the queue
-                    self.requeue_packet(packet);
+                    self.requeue_packet(packet2);
                 }
                 r => return r,
             }
