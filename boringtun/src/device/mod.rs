@@ -140,8 +140,6 @@ pub struct Device<T: DeviceTransports> {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    daita: Option<Arc<Mutex<DaitaHooks>>>,
-
     port: u16,
     udp_factory: T::UdpTransportFactory,
     connection: Option<Connection<T>>,
@@ -455,6 +453,8 @@ impl<T: DeviceTransports> Device<T> {
             rate_limiter: None,
             port: 0,
             connection: None,
+            daita: None,
+            hooks
         };
 
         let device = Arc::new(RwLock::new(device));
@@ -727,7 +727,7 @@ impl<T: DeviceTransports> Device<T> {
                     if peer.is_allowed_ip(addr) {
                         let Some(packet) = hooks.map_incoming_data(packet) else {
                             continue;
-                        }
+                        };
 
                         if let Err(_err) = tun_tx.send(packet).await {
                             log::trace!("buffered_tun_send.send failed");

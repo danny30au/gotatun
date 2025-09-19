@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug};
 
 use eyre::{bail, eyre};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, little_endian};
+use zerocopy::{little_endian, FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::packet::Packet;
 
@@ -12,7 +12,12 @@ pub struct Wg {
     rest: [u8],
 }
 
-#[derive(Clone)]
+impl Debug for Wg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Wg").field("packet_type", &self.packet_type).finish()
+    }
+}
+
 pub enum WgKind {
     HandshakeInit(Packet<WgHandshakeInit>),
     HandshakeResp(Packet<WgHandshakeResp>),
@@ -22,6 +27,7 @@ pub enum WgKind {
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, PartialEq, Eq, Clone, Copy)]
 #[repr(transparent)]
+// TODO: This is just one byte
 pub struct WgPacketType(pub little_endian::U32);
 
 impl WgPacketType {
@@ -36,7 +42,8 @@ impl WgPacketType {
 #[repr(C, packed)]
 pub struct WgData {
     // INVARIANT: Must be WgPacketType::Data
-    packet_type: WgPacketType,
+    // TODO: make private
+    pub packet_type: WgPacketType,
 
     pub receiver_idx: little_endian::U32,
     pub counter: little_endian::U64,
@@ -53,7 +60,17 @@ pub struct WgHandshakeInit {
     pub unencrypted_ephemeral: [u8; 32],
     pub encrypted_static: [u8; 48],
     pub encrypted_timestamp: [u8; 28],
-    _what_this: [u8; 32],
+    pub mac1: [u8; 16],
+    pub mac2: [u8; 16],
+}
+
+impl WgHandshakeInit {
+    pub fn new() -> Self {
+        Self {
+            packet_type: WgPacketType::HandshakeResp,
+            ..WgHandshakeInit::new_zeroed()
+        }
+    }
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
@@ -66,7 +83,26 @@ pub struct WgHandshakeResp {
     pub receiver_idx: little_endian::U32,
     pub unencrypted_ephemeral: [u8; 32],
     pub encrypted_nothing: [u8; 16],
-    _what_this: [u8; 32],
+    pub mac1: [u8; 16],
+    pub mac2: [u8; 16],
+}
+
+impl WgHandshakeResp {
+    pub fn new(
+        sender_idx: u32,
+        receiver_idx: u32,
+        unencrypted_ephemeral: [u8; 32],
+    ) -> Self {
+        Self {
+            packet_type: WgPacketType::HandshakeResp,
+            sender_idx: sender_idx.into(),
+            receiver_idx: receiver_idx.into(),
+            unencrypted_ephemeral,
+            encrypted_nothing: [0; 16],
+            mac1: [0u8; 16],
+            mac2: [0u8; 16],
+        }
+    }
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]

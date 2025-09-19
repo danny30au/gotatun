@@ -8,13 +8,14 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+use bytes::BytesMut;
 use zerocopy::IntoBytes;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
-use crate::packet::{Ipv4, Ipv6, Wg, WgData, WgKind};
+use crate::packet::{Ipv4, Ipv6, Wg, WgData, WgHandshakeInit, WgKind};
 use crate::x25519;
 
 use std::collections::VecDeque;
@@ -45,16 +46,16 @@ const MAX_QUEUE_DEPTH: usize = 256;
 const N_SESSIONS: usize = 8;
 
 #[derive(Debug)]
-pub enum TunnResult<'a> {
+pub enum TunnResult {
     Done,
     Err(WireGuardError),
-    WriteToNetwork(&'a mut [u8]),
+    WriteToNetwork(crate::packet::Packet<Wg>),
     WriteToTunnelV4(crate::packet::Packet<Ipv4>),
     WriteToTunnelV6(crate::packet::Packet<Ipv6>),
 }
 
-impl<'a> From<WireGuardError> for TunnResult<'a> {
-    fn from(err: WireGuardError) -> TunnResult<'a> {
+impl From<WireGuardError> for TunnResult {
+    fn from(err: WireGuardError) -> TunnResult {
         TunnResult::Err(err)
     }
 }
@@ -68,7 +69,7 @@ pub struct Tunn {
     /// Index of most recently used session
     current: usize,
     /// Queue to store blocked packets
-    packet_queue: VecDeque<Vec<u8>>,
+    packet_queue: VecDeque<crate::packet::Packet>,
     /// Keeps tabs on the expiring timers
     timers: timers::Timers,
     tx_bytes: usize,
@@ -250,41 +251,41 @@ impl Tunn {
     /// # Panics
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
-    pub fn handle_outgoing_packet<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn handle_outgoing_packet<'a>(&mut self, packet: crate::packet::Packet) -> TunnResult {
         let current = self.current;
 
-        match self.encapsulate_with_session(src, dst, current) {
+        match self.encapsulate_with_session(packet, current) {
             Ok(encapsulated_packet) => TunnResult::WriteToNetwork(encapsulated_packet),
-            Err(dst) => {
+            Err(packet) => {
                 // If there is no session, queue the packet for future retry
-                self.queue_packet(src);
+                self.queue_packet(packet);
                 // Initiate a new handshake if none is in progress
-                self.format_handshake_initiation(dst, false)
+                self.format_handshake_initiation(false)
             }
         }
     }
 
     fn encapsulate_with_session<'a>(
         &mut self,
-        src: &[u8],
-        dst: &'a mut [u8],
+        packet: crate::packet::Packet,
         current: usize,
-    ) -> Result<&'a mut [u8], &'a mut [u8]> {
+    ) -> Result<crate::packet::Packet<Wg>, crate::packet::Packet> {
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = session.format_packet_data(packet);
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
+            if packet.as_bytes().is_empty() {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
-            self.tx_bytes += src.len();
+            self.tx_bytes += packet.as_bytes().len();
             Ok(packet)
         } else {
-            Err(dst)
+            Err(packet)
         }
     }
 
+    /*
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
     ///
@@ -317,31 +318,27 @@ impl Tunn {
             _ => unreachable!(),
         };
 
-        self.handle_incoming_packet(packet, dst)
+        self.handle_incoming_packet(packet)
     }
+    */
 
-    pub(crate) fn handle_incoming_packet<'a>(
-        &mut self,
-        packet: WgKind,
-        dst: &'a mut [u8],
-    ) -> TunnResult<'a> {
+    pub(crate) fn handle_incoming_packet<'a>(&mut self, packet: WgKind) -> TunnResult<'a> {
         match packet {
-            WgKind::HandshakeInit(p) => self.handle_handshake_init(p, dst),
-            WgKind::HandshakeResp(p) => self.handle_handshake_response(p, dst),
+            WgKind::HandshakeInit(p) => self.handle_handshake_init(p),
+            WgKind::HandshakeResp(p) => self.handle_handshake_response(p),
             WgKind::CookieReply(p) => self.handle_cookie_reply(p),
-            WgKind::Data(p) => self.handle_data(p, dst),
+            WgKind::Data(p) => self.handle_data(p),
         }
         .unwrap_or_else(TunnResult::from)
     }
 
     fn handle_handshake_init<'a>(
         &mut self,
-        p: HandshakeInit,
-        dst: &'a mut [u8],
+        p: crate::packet::Packet<WgHandshakeInit>,
     ) -> Result<TunnResult<'a>, WireGuardError> {
         log::debug!("Received handshake_initiation: {}", p.sender_idx);
 
-        let (packet, session) = self.handshake.receive_handshake_initialization(p, dst)?;
+        let (packet, session) = self.handshake.receive_handshake_initialization(p)?;
 
         // Store new session in ring buffer
         let index = session.local_index();
@@ -359,7 +356,6 @@ impl Tunn {
     fn handle_handshake_response<'a>(
         &mut self,
         p: HandshakeResponse,
-        dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
         log::debug!(
             "Received handshake_response: {} {}",
@@ -429,7 +425,7 @@ impl Tunn {
         &mut self,
         packet: crate::packet::Packet<WgData>,
     ) -> Result<crate::packet::Packet, WireGuardError> {
-        let r_idx = packet.receiver_idx as usize;
+        let r_idx = packet.receiver_idx.get() as usize;
         let idx = r_idx % N_SESSIONS;
 
         // Get the (probably) right session
@@ -440,33 +436,7 @@ impl Tunn {
                 log::trace!("No current session available: {r_idx}");
                 WireGuardError::NoCurrentSession
             })?;
-            session.receive_packet_data(packet, dst)?
-        };
-
-        self.set_current_session(r_idx);
-
-        self.timer_tick(TimerName::TimeLastPacketReceived);
-
-        Ok(decapsulated_packet)
-    }
-
-    pub fn decapsulate_with_session_old<'a>(
-        &mut self,
-        packet: PacketData<'_>,
-        dst: &'a mut [u8],
-    ) -> Result<&'a mut [u8], WireGuardError> {
-        let r_idx = packet.receiver_idx as usize;
-        let idx = r_idx % N_SESSIONS;
-
-        // Get the (probably) right session
-        let decapsulated_packet = {
-            let session = self.sessions[idx].as_ref();
-            let session = session.ok_or_else(|| {
-                //log::trace!(message = "No current session available", remote_idx = r_idx);
-                log::trace!("No current session available: {r_idx}");
-                WireGuardError::NoCurrentSession
-            })?;
-            session.receive_packet_data(packet, dst)?
+            session.receive_packet_data(packet)?
         };
 
         self.set_current_session(r_idx);
@@ -478,11 +448,11 @@ impl Tunn {
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
     /// a new handshake, even if a handshake is already in progress (for example when a handshake times out)
-    pub fn format_handshake_initiation<'a>(
-        &mut self,
-        dst: &'a mut [u8],
-        force_resend: bool,
-    ) -> TunnResult<'a> {
+    pub fn format_handshake_initiation<'a>(&mut self, force_resend: bool) -> TunnResult {
+        let len = WgHandshakeInit::new();
+        let mut buf =
+            crate::packet::Packet::from_bytes(BytesMut::zeroed(size_of::<WgHandshakeInit>()));
+
         if self.handshake.is_in_progress() && !force_resend {
             return TunnResult::Done;
         }
@@ -493,7 +463,7 @@ impl Tunn {
 
         let starting_new_handshake = !self.handshake.is_in_progress();
 
-        match self.handshake.format_handshake_initiation(dst) {
+        match self.handshake.format_handshake_initiation() {
             Ok(packet) => {
                 log::debug!("Sending handshake_initiation");
 
@@ -501,7 +471,7 @@ impl Tunn {
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
-                TunnResult::WriteToNetwork(packet)
+                TunnResult::WriteToNetwork(packet.into())
             }
             Err(e) => TunnResult::Err(e),
         }
@@ -510,10 +480,7 @@ impl Tunn {
     // TODO: Use our zero-copy packet abstraction [crate::packet::Packet]
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
     /// Returns the truncated packet and the source IP as TunnResult
-    pub fn validate_decapsulated_packet<'a>(
-        &mut self,
-        packet: crate::packet::Packet,
-    ) -> TunnResult<'a> {
+    pub fn validate_decapsulated_packet(&mut self, packet: crate::packet::Packet) -> TunnResult {
         // TODO: truncate packet to ip_len
         let Ok(packet) = packet.try_into_ipvx() else {
             return TunnResult::Err(WireGuardError::InvalidPacket);
@@ -534,9 +501,9 @@ impl Tunn {
     }
 
     /// Get a packet from the queue, and try to encapsulate it
-    pub fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn send_queued_packet(&mut self, packet: Packet) -> TunnResult {
         if let Some(packet) = self.dequeue_packet() {
-            match self.handle_outgoing_packet(&packet, dst) {
+            match self.handle_outgoing_packet(packet) {
                 TunnResult::Err(_) => {
                     // On error, return packet to the queue
                     self.requeue_packet(packet);
@@ -548,22 +515,22 @@ impl Tunn {
     }
 
     /// Push packet to the back of the queue
-    fn queue_packet(&mut self, packet: &[u8]) {
+    fn queue_packet(&mut self, packet: crate::packet::Packet) {
         if self.packet_queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
-            self.packet_queue.push_back(packet.to_vec());
+            self.packet_queue.push_back(packet);
         }
     }
 
     /// Push packet to the front of the queue
-    fn requeue_packet(&mut self, packet: Vec<u8>) {
+    fn requeue_packet(&mut self, packet: crate::packet::Packet) {
         if self.packet_queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
             self.packet_queue.push_front(packet);
         }
     }
 
-    fn dequeue_packet(&mut self) -> Option<Vec<u8>> {
+    fn dequeue_packet(&mut self) -> Option<crate::packet::Packet> {
         self.packet_queue.pop_front()
     }
 
@@ -638,7 +605,7 @@ mod tests {
 
     fn create_handshake_init(tun: &mut Tunn) -> Vec<u8> {
         let mut dst = vec![0u8; 2048];
-        let handshake_init = tun.format_handshake_initiation(&mut dst, false);
+        let handshake_init = tun.format_handshake_initiation(false);
         assert!(matches!(handshake_init, TunnResult::WriteToNetwork(_)));
         let handshake_init = if let TunnResult::WriteToNetwork(sent) = handshake_init {
             sent

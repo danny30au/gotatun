@@ -117,21 +117,28 @@ impl<T: CheckedPayload + ?Sized> Packet<T> {
 // Trivial From conversions between packet types
 #[duplicate_item(
     FromType ToType;
-    [Ipv4<Udp>] [Ipv4];
-    [Ipv6<Udp>] [Ipv6];
+    [Ipv4<Udp>]             [Ipv4];
+    [Ipv6<Udp>]             [Ipv6];
 
-    [Ipv4<Udp>] [Ip];
-    [Ipv6<Udp>] [Ip];
-    [Ipv4]      [Ip];
-    [Ipv6]      [Ip];
+    [Ipv4<Udp>]             [Ip];
+    [Ipv6<Udp>]             [Ip];
+    [Ipv4]                  [Ip];
+    [Ipv6]                  [Ip];
 
-    [Ipv4<Udp>] [[u8]];
-    [Ipv6<Udp>] [[u8]];
-    [Ipv4]      [[u8]];
-    [Ipv6]      [[u8]];
-    [Ip]        [[u8]];
-    [Wg]        [[u8]];
-    [WgData]    [[u8]];
+    [Ipv4<Udp>]             [[u8]];
+    [Ipv6<Udp>]             [[u8]];
+    [Ipv4]                  [[u8]];
+    [Ipv6]                  [[u8]];
+    [Ip]                    [[u8]];
+    [Wg]                    [[u8]];
+    [WgData]                [[u8]];
+    [WgHandshakeInit]       [[u8]];
+    [WgHandshakeResp]       [[u8]];
+    [WgCookieReply]         [[u8]];
+    [WgHandshakeInit]       [Wg];
+    [WgHandshakeResp]       [Wg];
+    [WgCookieReply]         [Wg];
+    [WgData]                [Wg];
 )]
 impl From<Packet<FromType>> for Packet<ToType> {
     fn from(value: Packet<FromType>) -> Packet<ToType> {
@@ -160,6 +167,12 @@ impl Packet<[u8]> {
             },
             _kind: PhantomData::<[u8]>,
         }
+    }
+
+    pub fn overwrite_with<T: CheckedPayload>(mut self, payload: &T) -> Packet<T> {
+        self.buf_mut().clear();
+        self.buf_mut().extend_from_slice(payload.as_bytes());
+        self.cast()
     }
 
     pub fn from_bytes(bytes: BytesMut) -> Self {
