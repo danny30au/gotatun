@@ -193,7 +193,7 @@ impl RateLimiter {
             let cookie = self.current_cookie(addr);
             let computed_mac2 = b2s_keyed_mac_16_2(&cookie, packet_until_mac, mac1);
 
-            if !constant_time_eq(&computed_mac2[..16], mac2) {
+            if !constant_time_eq(&computed_mac2, mac2) {
                 let cookie_reply = self.format_cookie_reply(sender_idx, cookie, mac1);
                 let packet = handshake.overwrite_with(&cookie_reply);
                 return Err(TunnResult::WriteToNetwork(packet.into()));
