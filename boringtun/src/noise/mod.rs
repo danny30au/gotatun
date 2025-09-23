@@ -518,6 +518,24 @@ mod tests {
     }
 
     #[test]
+    // Verify that a valid hanshake is accepted by two linked peers when rate limiting is not
+    // applied.
+    fn verify_handshake() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let init = create_handshake_init(&mut my_tun);
+        their_tun
+            .rate_limiter
+            .verify_handshake(None, init.clone())
+            .expect("Handshake init to be valid");
+
+        let response = create_handshake_response(&mut their_tun, init);
+        my_tun
+            .rate_limiter
+            .verify_handshake(None, response)
+            .expect("Handshake response to be valid");
+    }
+
+    #[test]
     fn handshake_init_and_response() {
         let (mut my_tun, mut their_tun) = create_two_tuns();
         let init = create_handshake_init(&mut my_tun);
