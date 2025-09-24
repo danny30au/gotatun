@@ -333,21 +333,18 @@ impl<T: DeviceTransports> Device<T> {
     }
 
     fn remove_peer(&mut self, pub_key: &x25519::PublicKey) -> Option<Arc<Mutex<Peer>>> {
-        if let Some(peer) = self.peers.remove(pub_key) {
-            // Found a peer to remove, now purge all references to it:
-            {
-                let p = peer.blocking_lock();
-                self.peers_by_idx.remove(&p.index());
-            }
-            self.peers_by_ip
-                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(&peer, p));
-
-            log::info!("Peer removed");
-
-            Some(peer)
-        } else {
-            None
+        let peer = self.peers.remove(pub_key)?;
+        // Found a peer to remove, now purge all references to it:
+        {
+            let p = peer.blocking_lock();
+            self.peers_by_idx.remove(&p.index());
         }
+        self.peers_by_ip
+            .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(&peer, p));
+
+        log::info!("Peer removed");
+
+        Some(peer)
     }
 
     /// Update or add peer
