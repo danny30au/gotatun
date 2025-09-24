@@ -375,10 +375,6 @@ impl<T: DeviceTransports> Device<T> {
                 .collect();
             drop(peer);
 
-            // TODO: Match pubkey instead of index
-            self.peers_by_ip
-                .remove(&|p| p.blocking_lock().index() == index);
-
             (index, old_allowed_ips)
         } else {
             (self.next_index(), vec![])
