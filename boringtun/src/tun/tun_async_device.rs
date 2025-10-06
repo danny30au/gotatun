@@ -35,6 +35,7 @@ impl TunDevice {
         };
 
         let mtu = tun.mtu()?;
+        log::error!("TUN MTU: {mtu}");
         let (tx, rx) = watch::channel(mtu);
 
         let tun = Arc::new(tun);
@@ -49,6 +50,7 @@ impl TunDevice {
                 let tun = tun_weak.upgrade()?;
                 let new = tun.mtu().ok()?;
                 if new != mtu {
+                    log::error!("new TUN MTU: {new}");
                     mtu = new;
                     tx.send(mtu).ok()?;
                 }
