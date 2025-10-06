@@ -79,6 +79,7 @@ impl UdpSend for super::UdpSocket {
         UdpSocket::local_addr(self).map(Some)
     }
 
+    #[cfg(target_os = "linux")]
     fn set_fwmark(&self, mark: u32) -> io::Result<()> {
         setsockopt(&self.inner, sockopt::Mark, &mark)?;
         Ok(())
@@ -239,11 +240,11 @@ mod gro {
 #[cfg(target_os = "android")]
 mod android {
     use crate::packet::{Packet, PacketBufPool};
-    use crate::udp::{UdpRecv, UdpSocket, UdpTransport};
+    use crate::udp::{UdpRecv, socket::UdpSocket};
     use std::io;
     use std::net::SocketAddr;
 
-    impl UdpRecv for UdpSocket {
+    impl UdpRecv for super::UdpSocket {
         type RecvManyBuf = ();
 
         async fn recv_from(
@@ -254,12 +255,6 @@ mod android {
             let (n, src) = self.inner.recv_from(&mut buf).await?;
             buf.truncate(n);
             Ok((buf, src))
-        }
-    }
-
-    impl UdpTransport for UdpSocket {
-        fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
-            UdpSocket::local_addr(self).map(Some)
         }
     }
 }
