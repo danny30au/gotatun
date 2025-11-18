@@ -12,7 +12,7 @@ use crate::{
     tun::{IpRecv, IpSend, MtuWatcher},
 };
 
-use std::{convert::Infallible, io, iter, sync::Arc, time::Duration};
+use std::{convert::Infallible, io, iter, net::IpAddr, sync::Arc, time::Duration};
 
 /// A kernel virtual network device; a TUN device.
 ///
@@ -88,7 +88,27 @@ impl IpRecv for TunDevice {
         let n = self.tun.recv(&mut packet).await?;
         packet.truncate(n);
         match packet.try_into_ip() {
-            Ok(packet) => Ok(iter::once(packet)),
+            Ok(packet) => {
+                let packet = packet.try_into_ipvx().expect("packet is not ipv4/ipv6");
+                let (source, dest, len, proto, packet) = match packet {
+                    either::Either::Left(ipv4) => (
+                        IpAddr::from(ipv4.header.source()),
+                        IpAddr::from(ipv4.header.destination()),
+                        ipv4.header.total_len,
+                        ipv4.header.next_protocol(),
+                        ipv4.into(),
+                    ),
+                    either::Either::Right(ipv6) => (
+                        IpAddr::from(ipv6.header.source()),
+                        IpAddr::from(ipv6.header.destination()),
+                        ipv6.header.payload_length,
+                        ipv6.header.next_protocol(),
+                        ipv6.into(),
+                    ),
+                };
+                log::warn!("Read from TUN {proto:?} len={len} {source}->{dest}");
+                Ok(iter::once(packet))
+            }
             Err(e) => Err(io::Error::other(e.to_string())),
         }
     }
