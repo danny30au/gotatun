@@ -27,10 +27,18 @@ impl Debug for Wg {
     }
 }
 
+/// An owned WireGuard [`Packet`] where its kind is known. See [`Packet::try_into_wg`].
 pub enum WgKind {
+    /// An owned [`WgHandshakeInit`] packet.
     HandshakeInit(Packet<WgHandshakeInit>),
+
+    /// An owned [`WgHandshakeResp`] packet.
     HandshakeResp(Packet<WgHandshakeResp>),
+
+    /// An owned [`WgCookieReply`] packet.
     CookieReply(Packet<WgCookieReply>),
+
+    /// An owned [`WgData`] packet.
     Data(Packet<WgData>),
 }
 
@@ -80,15 +88,24 @@ impl From<WgKind> for Packet {
     }
 }
 
+/// The first byte of a WireGuard packet that identifies its type.
 #[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, PartialEq, Eq, Clone, Copy)]
 #[repr(transparent)]
 pub struct WgPacketType(pub u8);
 
 impl WgPacketType {
     #![allow(non_upper_case_globals)]
+
+    /// The type discriminant of a [`WgHandshakeInit`] packet.
     pub const HandshakeInit: WgPacketType = WgPacketType(1);
+
+    /// The type discriminant of a [`WgHandshakeResp`] packet.
     pub const HandshakeResp: WgPacketType = WgPacketType(2);
+
+    /// The type discriminant of a [`WgCookieReply`] packet.
     pub const CookieReply: WgPacketType = WgPacketType(3);
+
+    /// The type discriminant of a [`WgData`] packet.
     pub const Data: WgPacketType = WgPacketType(4);
 }
 
@@ -342,7 +359,7 @@ impl Default for WgCookieReply {
 }
 
 impl Packet {
-    /// Convert into a wireguard packet while sanity-checking packet type and size.
+    /// Try to cast to a WireGuard packet while sanity-checking packet type and size.
     pub fn try_into_wg(self) -> eyre::Result<WgKind> {
         let wg = Wg::ref_from_bytes(self.as_bytes())
             .map_err(|_| eyre!("Not a wireguard packet, too small."))?;
