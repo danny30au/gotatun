@@ -15,10 +15,10 @@
 //! buffer.
 //!
 //! Any of the <https://docs.rs/zerocopy>-enabled definitions such as [`Ipv4`] or [`Udp`] can be used to cheaply
-//! construct or parse packets:
+//! construct or parse packets (through [`Decoder`]):
 //! ```
 //! let example_ipv4_icmp: &mut [u8] = &mut [
-//!     0x45, 0x83, 0x0, 0x54, 0xa3, 0x13, 0x40, 0x0, 0x40, 0x1, 0xc6, 0x26, 0xa, 0x8c, 0xc2, 0xdd,
+//!     0x45, 0x83, 0x0, 0x54, 0xa3, 0x13, 0x40, 0x0, 0x40, 0x1, 0xc5, 0xa3, 0xa, 0x8c, 0xc2, 0xdd,
 //!     0x1, 0x2, 0x3, 0x4, 0x8, 0x0, 0x51, 0x13, 0x0, 0x2b, 0x0, 0x1, 0xb1, 0x5c, 0x87, 0x68, 0x0,
 //!     0x0, 0x0, 0x0, 0xa8, 0x28, 0x7, 0x0, 0x0, 0x0, 0x0, 0x0, 0x10, 0x11, 0x12, 0x13, 0x14,
 //!     0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23,
@@ -26,15 +26,14 @@
 //!     0x33, 0x34, 0x35, 0x36, 0x37,
 //! ];
 //!
-//! use gotatun::packet::{Ipv4, Ipv4Header, IpNextProtocol};
+//! use gotatun::packet::{Decoder, Ipv4, Ipv4Decoder, Ipv4Header, IpNextProtocol};
 //! use zerocopy::FromBytes;
 //! use std::net::Ipv4Addr;
 //!
-//! // Cast the `&[u8]` to an &Ipv4.
-//! // Note that this doesn't validate anything about the packet,
-//! // except that it's at least Ipv4Header::LEN bytes long.
-//! let packet = Ipv4::<[u8]>::mut_from_bytes(example_ipv4_icmp)
-//!     .expect("Packet must be large enough to be IPv4");
+//! // Decode the `&[u8]` to an &Ipv4, while validaing the checksum, and IP header fields.
+//! // Note that this doesn't validate anything about the ICMP payload.
+//! let packet: &mut Ipv4<[u8]> = Ipv4Decoder::CHECK_ALL.decode_mut(example_ipv4_icmp)
+//!     .expect("Is a valid IPv4 packet");
 //! let header: &mut Ipv4Header = &mut packet.header;
 //! let payload: &mut [u8] = &mut packet.payload;
 //!
@@ -42,7 +41,7 @@
 //! assert_eq!(header.version(), 4);
 //! assert_eq!(header.source(), Ipv4Addr::new(10, 140, 194, 221));
 //! assert_eq!(header.destination(), Ipv4Addr::new(1, 2, 3, 4));
-//! assert_eq!(header.header_checksum, 0xc626);
+//! assert_eq!(header.header_checksum, 0xc5a3);
 //! assert_eq!(header.protocol, IpNextProtocol::Icmp);
 //!
 //! // Write stuff to the header. Note that this invalidates the checksum.
@@ -62,21 +61,25 @@ use std::{
 use bytes::{Buf, BytesMut};
 use duplicate::duplicate_item;
 use either::Either;
-use eyre::{Context, bail, eyre};
+use eyre::{bail, eyre};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+mod decode;
 mod ip;
 mod ipv4;
 mod ipv6;
 mod pool;
+mod tcp;
 mod udp;
 mod util;
 mod wg;
 
+pub use decode::*;
 pub use ip::*;
 pub use ipv4::*;
 pub use ipv6::*;
 pub use pool::*;
+pub use tcp::*;
 pub use udp::*;
 pub use util::*;
 pub use wg::*;
@@ -85,8 +88,8 @@ pub use wg::*;
 ///
 /// The generic type `Kind` represents the type of packet.
 /// For example, a `Packet<[u8]>` is an untyped packet containing arbitrary bytes.
-/// It can be safely decoded into a `Packet<Ipv4>` using [`Packet::try_into_ip`],
-/// and further decoded into a `Packet<Ipv4<Udp>>` using [`Packet::try_into_udp`].
+/// The bytes can be parsed as a concrete type using [`Decoder::decode_owned`], or by using
+/// convenience methods like [`Packet::try_into_ipvx`] and [`Packet::try_into_udp`].
 ///
 /// [`Packet`] uses [`BytesMut`] as the backing buffer.
 ///
@@ -126,44 +129,36 @@ struct PacketInner {
     _return_to_pool: Option<ReturnToPool>,
 }
 
-/// A marker trait that indicates that a [Packet] contains a valid payload of a specific type.
-///
-/// For example, [`CheckedPayload`] is implemented for [`Ipv4<[u8]>`], and a [`Packet<Ipv4<[u8]>>>`]
-/// can only be constructed through [`Packet::<[u8]>::try_into_ipvx`], which checks that the IPv4
-/// header is valid.
-pub trait CheckedPayload: FromBytes + IntoBytes + KnownLayout + Immutable + Unaligned {}
+/// Plain ol' data. A helper trait for types that can be cast to/from bytes.
+pub trait PoD: FromBytes + IntoBytes + KnownLayout + Immutable + Unaligned {}
+impl<T: FromBytes + IntoBytes + KnownLayout + Immutable + Unaligned + ?Sized> PoD for T {}
 
-impl CheckedPayload for [u8] {}
-impl CheckedPayload for Ip {}
-impl<P: CheckedPayload + ?Sized> CheckedPayload for Ipv6<P> {}
-impl<P: CheckedPayload + ?Sized> CheckedPayload for Ipv4<P> {}
-impl<P: CheckedPayload + ?Sized> CheckedPayload for Udp<P> {}
-impl CheckedPayload for WgHandshakeInit {}
-impl CheckedPayload for WgHandshakeResp {}
-impl CheckedPayload for WgCookieReply {}
-impl CheckedPayload for WgData {}
-
-impl<T: CheckedPayload + ?Sized> Packet<T> {
+impl<T: IntoBytes + KnownLayout + Immutable + ?Sized> Packet<T> {
     /// Cast `T` to `Y` without checking anything.
     ///
     /// Only invoke this after checking that the backing buffer contain a bitwise valid `Y` type.
     /// Incorrect usage of this function will cause [`Packet::deref`] to panic.
-    fn cast<Y: CheckedPayload + ?Sized>(self) -> Packet<Y> {
+    fn cast<Y: FromBytes + KnownLayout + Immutable + ?Sized>(self) -> Packet<Y> {
         Packet {
             inner: self.inner,
             _kind: PhantomData::<Y>,
         }
     }
+}
 
+impl<T: IntoBytes + KnownLayout + Immutable + ?Sized> Packet<T> {
     /// Discard the type of this packet and treat it as a pile of bytes.
     pub fn into_bytes(self) -> Packet<[u8]> {
         self.cast()
     }
 
+    #[cfg(test)]
     fn buf(&self) -> &[u8] {
         &self.inner.buf
     }
+}
 
+impl<T: IntoBytes + FromBytes + KnownLayout + Immutable + ?Sized> Packet<T> {
     /// Create a `Packet<T>` from a `&T`.
     pub fn copy_from(payload: &T) -> Self {
         Self {
@@ -180,7 +175,10 @@ impl<T: CheckedPayload + ?Sized> Packet<T> {
     ///
     /// If the `Y` won't fit into the backing buffer, this call will allocate, and effectively
     /// devolves into [`Packet::copy_from`].
-    pub fn overwrite_with<Y: CheckedPayload>(mut self, payload: &Y) -> Packet<Y> {
+    pub fn overwrite_with<Y: IntoBytes + FromBytes + KnownLayout + Immutable + ?Sized>(
+        mut self,
+        payload: &Y,
+    ) -> Packet<Y> {
         self.inner.buf.clear();
         self.inner.buf.extend_from_slice(payload.as_bytes());
         self.cast()
@@ -189,28 +187,58 @@ impl<T: CheckedPayload + ?Sized> Packet<T> {
 
 // Trivial `From`-conversions between packet types
 #[duplicate_item(
-    FromType ToType;
-    [Ipv4<Udp>]             [Ipv4];
-    [Ipv6<Udp>]             [Ipv6];
+    FromType                ToType;
+    [Ipv4<Udp>]             [Ipv4<[u8]>];
+    [Ipv6<Udp>]             [Ipv6<[u8]>];
+    [Ipv4<Tcp>]             [Ipv4<[u8]>];
+    [Ipv6<Tcp>]             [Ipv6<[u8]>];
 
     [Ipv4<Udp>]             [Ip];
     [Ipv6<Udp>]             [Ip];
-    [Ipv4]                  [Ip];
-    [Ipv6]                  [Ip];
+    [Ipv4<Tcp>]             [Ip];
+    [Ipv6<Tcp>]             [Ip];
+    [Ipv4<[u8]>]            [Ip];
+    [Ipv6<[u8]>]            [Ip];
 
     [Ipv4<Udp>]             [[u8]];
     [Ipv6<Udp>]             [[u8]];
-    [Ipv4]                  [[u8]];
-    [Ipv6]                  [[u8]];
+    [Ipv4<Tcp>]             [[u8]];
+    [Ipv6<Tcp>]             [[u8]];
+    [Ipv4<[u8]>]            [[u8]];
+    [Ipv6<[u8]>]            [[u8]];
     [Ip]                    [[u8]];
     [WgData]                [[u8]];
-    [WgHandshakeInit]       [[u8]];
-    [WgHandshakeResp]       [[u8]];
-    [WgCookieReply]         [[u8]];
 )]
 impl From<Packet<FromType>> for Packet<ToType> {
     fn from(value: Packet<FromType>) -> Packet<ToType> {
         value.cast()
+    }
+}
+
+/// Implement Into<Packet<[u8]>> for all sized [`IntoBytes`]-types.
+impl<P: IntoBytes + KnownLayout + Immutable + Unaligned> From<Packet<P>> for Packet<[u8]> {
+    fn from(value: Packet<P>) -> Packet<[u8]> {
+        value.cast()
+    }
+}
+
+#[duplicate_item(
+    FromType ToType either_fn;
+     [[u8]]  [Ipv4] [ left];
+     [[u8]]  [Ipv6] [right];
+     [ Ip ]  [Ipv4] [ left];
+     [ Ip ]  [Ipv6] [right];
+)]
+impl TryFrom<Packet<FromType>> for Packet<ToType> {
+    type Error = eyre::Report;
+
+    fn try_from(packet: Packet<FromType>) -> Result<Self, Self::Error> {
+        packet.try_into_ipvx()?.either_fn().ok_or_else(|| {
+            eyre!(
+                "Expected {} but found another IP version",
+                stringify!(ToType)
+            )
+        })
     }
 }
 
@@ -271,16 +299,12 @@ impl Packet<[u8]> {
     ///
     /// Returns [`Err`] if this packet is smaller than [`Ipv4Header::LEN`] bytes.
     pub fn try_into_ip(self) -> eyre::Result<Packet<Ip>> {
-        let buf_len = self.buf().len();
-
-        // IPv6 packets are larger, but their length after we know the packet IP version.
-        // This is the smallest any packet can be.
-        if buf_len < Ipv4Header::LEN {
-            bail!("Packet too small ({buf_len} < {})", Ipv4Header::LEN);
-        }
-
-        // we have asserted that the packet is long enough to _maybe_ be an IP packet.
-        Ok(self.cast::<Ip>())
+        let decoder = IpDecoder {
+            version: false,
+            min_length: true,
+        };
+        let packet = decoder.decode_owned(self)?;
+        Ok(packet)
     }
 
     /// Try to cast this untyped packet into either an [`Ipv4`] or [`Ipv6`] packet.
@@ -310,125 +334,121 @@ impl Packet<Ip> {
     /// - The IP version field is `4` or `6`
     /// - The IPv4 packet is smaller than [`Ipv4Header::total_len`].
     /// - The IPv6 payload is smaller than [`Ipv6Header::payload_length`].
-    pub fn try_into_ipvx(mut self) -> eyre::Result<Either<Packet<Ipv4>, Packet<Ipv6>>> {
+    pub fn try_into_ipvx(self) -> eyre::Result<Either<Packet<Ipv4>, Packet<Ipv6>>> {
         match self.header.version() {
             4 => {
-                let buf_len = self.buf().len();
-
-                let ipv4 = Ipv4::<[u8]>::ref_from_bytes(self.buf())
-                    .map_err(|e| eyre!("Bad IPv4 packet: {e:?}"))?;
-
-                let ip_len = usize::from(ipv4.header.total_len.get());
-                if ip_len > buf_len {
-                    bail!("IPv4 `total_len` exceeded actual packet length: {ip_len} > {buf_len}");
-                }
-                if ip_len < Ipv4Header::LEN {
-                    bail!(
-                        "IPv4 `total_len` less than packet header len: {ip_len} < {}",
-                        Ipv4Header::LEN
-                    );
-                }
-
-                self.inner.buf.truncate(ip_len);
-
                 // NOTE: We do not validate the checksum here due to the fact that the Poly1305 tag
                 // already proves that the packet was not modified in transit. Assuming that the
                 // transport and IP checksums were valid at the point of encapsulation, then the
                 // checksums are still valid after decapsulation.
                 // See https://github.com/torvalds/linux/blob/af4e9ef3d78420feb8fe58cd9a1ab80c501b3c08/drivers/net/wireguard/receive.c#L376-L382
+                let decoder = Ipv4Decoder {
+                    checksum: false,
+                    version: false,
+                    ..Ipv4Decoder::CHECK_ALL
+                };
 
-                // we have asserted that the packet is a valid IPv4 packet.
-                // update `_kind` to reflect this.
-                Ok(Either::Left(self.cast::<Ipv4>()))
+                decoder.decode_owned(self).map(Either::Left)
             }
             6 => {
-                let ipv6 = Ipv6::<[u8]>::ref_from_bytes(self.buf())
-                    .map_err(|e| eyre!("Bad IPv6 packet: {e:?}"))?;
+                let decoder = Ipv6Decoder {
+                    version: false,
+                    ..Ipv6Decoder::CHECK_ALL
+                };
 
-                let payload_len = usize::from(ipv6.header.payload_length.get());
-                if payload_len > ipv6.payload.len() {
-                    bail!(
-                        "IPv6 `payload_len` exceeded actual payload length: {payload_len} > {}",
-                        ipv6.payload.len()
-                    );
-                }
-
-                self.inner.buf.truncate(payload_len + Ipv6Header::LEN);
-
-                // We do not validate the checksum. See reasoning above.
-
-                // we have asserted that the packet is a valid IPv6 packet.
-                // update `_kind` to reflect this.
-                Ok(Either::Right(self.cast::<Ipv6>()))
+                decoder.decode_owned(self).map(Either::Right)
             }
             v => bail!("Bad IP version: {v}"),
         }
+        .map_err(Into::into)
     }
 }
 
 impl Packet<Ipv4> {
     /// Try to cast this [`Ipv4`] packet into an [`Udp`] packet.
     ///
-    /// Returns `Packet<Ipv4<Udp>>` if the packet is a valid,
-    /// non-fragmented IPv4 UDP packet with no options (IHL == `5`).
+    /// Returns `Packet<Ipv4<Udp>>` if the packet is a valid, non-fragmented IPv4 UDP packet.
     ///
     /// # Errors
     /// Returns an error if
+    /// - buffer size is too small
+    /// - next_protocol is not UDP
     /// - the packet is a fragment
-    /// - the IHL is not `5`
-    /// - UDP validation fails
+    /// - UDP length is invalid
     pub fn try_into_udp(self) -> eyre::Result<Packet<Ipv4<Udp>>> {
-        let ip = self.deref();
+        let decoder = Ipv4PayloadDecoder {
+            ip_next_protocol: true,
+            dont_fragment: true,
+            inner: UdpDecoder {
+                length: true,
+                checksum: false,
+            },
+        };
+        Ok(decoder.decode_owned(self)?)
+    }
 
-        // We validate the IHL here, instead of in the `try_into_ipvx` method,
-        // because there we can still parse the part of the Ipv4 header that is always present
-        // and ignore the options. To parse the UDP packet, we must know that the IHL is 5,
-        // otherwise it will not start at the right offset.
-        match ip.header.ihl() {
-            5 => {}
-            6.. => {
-                return Err(eyre!("IP header: {:?}", ip.header))
-                    .wrap_err(eyre!("IPv4 packets with options are not supported"));
-            }
-            ihl @ ..5 => {
-                return Err(eyre!("IP header: {:?}", ip.header))
-                    .wrap_err(eyre!("Bad IHL value: {ihl}"));
-            }
-        }
-
-        if ip.header.fragment_offset() != 0 || ip.header.more_fragments() {
-            eyre::bail!("IPv4 packet is a fragment: {:?}", ip.header);
-        }
-
-        validate_udp(ip.header.next_protocol(), &ip.payload)
-            .wrap_err_with(|| eyre!("IP header: {:?}", ip.header))?;
-
-        // we have asserted that the packet is a valid IPv4 UDP packet.
-        // update `_kind` to reflect this.
-        Ok(self.cast::<Ipv4<Udp>>())
+    /// Try to cast this [`Ipv4`] packet into a [`Tcp`] packet.
+    ///
+    /// Returns `Packet<Ipv4<Tcp>>` if the packet is a valid, non-fragmented IPv4 TCP packet.
+    ///
+    /// # Errors
+    /// Returns an error if
+    /// - buffer size is too small
+    /// - next_protocol is not TCP
+    /// - the packet is a fragment
+    /// - TCP data_offset is invalid
+    pub fn try_into_tcp(self) -> eyre::Result<Packet<Ipv4<Tcp>>> {
+        let decoder = Ipv4PayloadDecoder {
+            ip_next_protocol: true,
+            dont_fragment: true,
+            inner: TcpDecoder {
+                data_offset: true,
+                checksum: false,
+            },
+        };
+        Ok(decoder.decode_owned(self)?)
     }
 }
 
 impl Packet<Ipv6> {
     /// Try to cast this [`Ipv6`] packet into an [`Udp`] packet.
     ///
-    /// Returns `Packet<Ipv6<Udp>>` if the packet is a valid IPv6 UDP packet.
+    /// # Errors
+    /// Returns an error if
+    /// - buffer size is too small
+    /// - next_protocol is not UDP
+    /// - UDP length is invalid
+    pub fn try_into_udp(self) -> eyre::Result<Packet<Ipv6<Udp>>> {
+        let decoder = Ipv6PayloadDecoder {
+            ip_next_protocol: true,
+            inner: UdpDecoder {
+                length: true,
+                checksum: false,
+            },
+        };
+        Ok(decoder.decode_owned(self)?)
+    }
+
+    /// Try to cast this [`Ipv6`] packet into an [`Tcp`] packet.
     ///
     /// # Errors
-    /// Returns an error if UDP validation fails
-    pub fn try_into_udp(self) -> eyre::Result<Packet<Ipv6<Udp>>> {
-        let ip = self.deref();
-
-        validate_udp(ip.header.next_protocol(), &ip.payload)
-            .wrap_err_with(|| eyre!("IP header: {:?}", ip.header))?;
-
-        // we have asserted that the packet is a valid IPv6 UDP packet.
-        // update `_kind` to reflect this.
-        Ok(self.cast::<Ipv6<Udp>>())
+    /// Returns an error if
+    /// - buffer size is too small
+    /// - next_protocol is not TCP
+    /// - TCP data_offset is invalid
+    pub fn try_into_tcp(self) -> eyre::Result<Packet<Ipv6<Tcp>>> {
+        let decoder = Ipv6PayloadDecoder {
+            ip_next_protocol: true,
+            inner: TcpDecoder {
+                data_offset: true,
+                checksum: false,
+            },
+        };
+        Ok(decoder.decode_owned(self)?)
     }
 }
 
-impl<T: CheckedPayload + ?Sized> Packet<Ipv4<T>> {
+impl<T: PoD + ?Sized> Packet<Ipv4<T>> {
     /// Strip the IPv4 header and return the payload.
     pub fn into_payload(mut self) -> Packet<T> {
         debug_assert_eq!(
@@ -440,14 +460,14 @@ impl<T: CheckedPayload + ?Sized> Packet<Ipv4<T>> {
         self.cast::<T>()
     }
 }
-impl<T: CheckedPayload + ?Sized> Packet<Ipv6<T>> {
+impl<T: PoD + ?Sized> Packet<Ipv6<T>> {
     /// Strip the IPv6 header and return the payload.
     pub fn into_payload(mut self) -> Packet<T> {
         self.inner.buf.advance(Ipv6Header::LEN);
         self.cast::<T>()
     }
 }
-impl<T: CheckedPayload + ?Sized> Packet<Udp<T>> {
+impl<T: PoD + ?Sized> Packet<Udp<T>> {
     /// Strip the UDP header and return the payload.
     pub fn into_payload(mut self) -> Packet<T> {
         self.inner.buf.advance(UdpHeader::LEN);
@@ -455,37 +475,9 @@ impl<T: CheckedPayload + ?Sized> Packet<Udp<T>> {
     }
 }
 
-fn validate_udp(next_protocol: IpNextProtocol, payload: &[u8]) -> eyre::Result<()> {
-    let IpNextProtocol::Udp = next_protocol else {
-        bail!("Expected UDP, but packet was {next_protocol:?}");
-    };
-
-    let ip_payload_len = payload.len();
-    let udp = Udp::<[u8]>::ref_from_bytes(payload).map_err(|e| eyre!("Bad UDP packet: {e:?}"))?;
-
-    let udp_len = usize::from(udp.header.length.get());
-    if udp_len != ip_payload_len {
-        return Err(eyre!("UDP header: {:?}", udp.header)).wrap_err_with(|| {
-            eyre!(
-                "UDP header length did not match IP payload length: {} != {}",
-                udp_len,
-                ip_payload_len,
-            )
-        });
-    }
-
-    // NOTE: We do not validate the checksum here due to the fact that the Poly1305 tag
-    // already proves that the packet was not modified in transit. Assuming that the
-    // transport and IP checksums were valid at the point of encapsulation, then the
-    // checksums are still valid after decapsulation.
-    // See https://github.com/torvalds/linux/blob/af4e9ef3d78420feb8fe58cd9a1ab80c501b3c08/drivers/net/wireguard/receive.c#L376-L382
-
-    Ok(())
-}
-
 impl<Kind> Deref for Packet<Kind>
 where
-    Kind: CheckedPayload + ?Sized,
+    Kind: FromBytes + KnownLayout + Immutable + Unaligned + ?Sized,
 {
     type Target = Kind;
 
@@ -497,7 +489,7 @@ where
 
 impl<Kind> DerefMut for Packet<Kind>
 where
-    Kind: CheckedPayload + ?Sized,
+    Kind: PoD + ?Sized,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         Self::Target::mut_from_bytes(&mut self.inner.buf)
@@ -522,7 +514,7 @@ impl<Kind: ?Sized> Clone for Packet<Kind> {
 
 impl<Kind: Debug> Debug for Packet<Kind>
 where
-    Kind: CheckedPayload + ?Sized,
+    Kind: PoD + ?Sized,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Packet").field(&self.deref()).finish()

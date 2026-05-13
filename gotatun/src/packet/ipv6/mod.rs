@@ -10,16 +10,25 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use bitfield_struct::bitfield;
+use duplicate::duplicate_item;
+use eyre::eyre;
 use std::{fmt::Debug, net::Ipv6Addr};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned, big_endian};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned, big_endian};
 
-use super::{IpNextProtocol, util::size_must_be};
+use crate::packet::{Tcp, TcpDecoder};
+
+use super::{
+    DecodeError, Decoder, IpNextProtocol, PseudoHeaderV6, Udp, UdpDecoder, util::size_must_be,
+};
 
 /// An IPv6 packet.
 ///
-/// This is a dynamically sized zerocopy type, which means you can compose packet types like
-/// `Ipv6<Udp<WgData>>` and cast them to/from byte slices using [`FromBytes`] and [`IntoBytes`].
-/// [Read more](crate::packet)
+/// This is a dynamically sized [`zerocopy`] type which allows for cheap conversions.
+/// The generic payload allows you to compose packet types like `Ipv6<Udp<WgData>>`.
+///
+/// Use [`Ipv6Decoder`] and [`Ipv6PayloadDecoder`] for parsing into these packet types from
+/// byte slices and such. You can also use [`FromBytes`] and [`IntoBytes`] if you want minimal
+/// validation. [Read more](crate::packet)
 #[repr(C)]
 #[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 pub struct Ipv6<Payload: ?Sized = [u8]> {
@@ -122,6 +131,22 @@ impl Ipv6Header {
     }
 }
 
+impl<P: ?Sized> Ipv6<P>
+where
+    P: IntoBytes + Immutable,
+{
+    /// Update [`Ipv6Header::payload_length`] to match real payload size.
+    pub fn try_update_ip_len(&mut self) -> eyre::Result<()> {
+        self.header.payload_length = self
+            .payload
+            .as_bytes()
+            .len()
+            .try_into()
+            .map_err(|_| eyre!("IPv6 payload was larger than {}", u16::MAX))?;
+        Ok(())
+    }
+}
+
 impl Debug for Ipv6Header {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ipv6Header")
@@ -137,12 +162,122 @@ impl Debug for Ipv6Header {
     }
 }
 
+/// An [`Ipv6`] [`Decoder`].
+pub struct Ipv6Decoder {
+    /// Fail if version field is not `6`.
+    pub version: bool,
+
+    // TODO: length and truncate should be mutually exclusive
+    /// Fail if IPv6 header length is too big.
+    pub length: bool,
+    /// Truncate the buffer if it's longer than header length.
+    pub truncate: bool,
+}
+
+impl Ipv6Decoder {
+    /// Validate as *much* as possible about the decoded packet.
+    pub const CHECK_ALL: Self = Self {
+        version: true,
+        length: true,
+        truncate: true,
+    };
+
+    /// Validate as *little* as possible about the decoded packet.
+    pub const UNCHECKED: Self = Self {
+        version: false,
+        length: false,
+        truncate: false,
+    };
+}
+
+/// Decode a byte slice into an [`Ipv6`] packet.
+impl Decoder<[u8], Ipv6<[u8]>> for Ipv6Decoder {
+    fn validate(&self, bytes: &[u8]) -> Result<usize, DecodeError> {
+        let ipv6: &Ipv6 = Ipv6::try_ref_from_bytes(bytes)?;
+
+        if self.version && ipv6.header.version() != 6 {
+            return Err(DecodeError::InvalidValue("version"));
+        }
+
+        let total_len = ipv6.header.total_length();
+        if (self.length || self.truncate) && total_len > bytes.len() {
+            return Err(DecodeError::InvalidValue("total length"));
+        }
+
+        let len = if self.truncate {
+            total_len
+        } else {
+            bytes.len()
+        };
+
+        Ok(len)
+    }
+}
+
+#[duplicate_item(
+    Proto ProtoDecoder proto_str from_proto_fn checksum_fn;
+    [Tcp] [TcpDecoder] ["TCP"] [from_tcp] [checksum_tcp_with_skip];
+    [Udp] [UdpDecoder] ["UDP"] [from_udp] [checksum_udp_with_skip];
+)]
+/// Decode the [`Ipv6::payload`].
+impl Decoder<Ipv6<[u8]>, Ipv6<Proto>> for Ipv6PayloadDecoder<ProtoDecoder> {
+    fn validate(&self, ipv6: &Ipv6<[u8]>) -> Result<usize, DecodeError> {
+        if self.ip_next_protocol && ipv6.header.next_protocol() != IpNextProtocol::Proto {
+            return Err(DecodeError::InvalidValue("protocol"));
+        }
+
+        if self.inner.checksum {
+            let proto = Proto::<[u8]>::try_ref_from_bytes(&ipv6.payload)?;
+
+            let header = PseudoHeaderV6::from_proto_fn(
+                ipv6.header.source_address,
+                ipv6.header.destination_address,
+                proto,
+            );
+            let expected_csum = crate::packet::util::checksum_fn(header, proto);
+            if expected_csum != proto.header.checksum.get() {
+                return Err(DecodeError::InvalidValue(concat!(proto_str, " checksum")));
+            }
+        }
+
+        let len = self.inner.validate(&ipv6.payload)?;
+        Ok(len + Ipv6Header::LEN)
+    }
+}
+
+/// A [`Decoder`] for [`Ipv6::payload`] into a transport protocol like [`Udp`].
+pub struct Ipv6PayloadDecoder<Inner> {
+    /// Assert that [`IpNextProtocol`] matches the payload.
+    pub ip_next_protocol: bool,
+    /// Decoder for the inner transport protocol
+    pub inner: Inner,
+}
+
+#[duplicate_item(
+    Inner;
+    [UdpDecoder];
+    [TcpDecoder];
+)]
+impl Ipv6PayloadDecoder<Inner> {
+    /// Validate as *much* as possible about the decoded payload.
+    pub const CHECK_ALL: Self = Self {
+        ip_next_protocol: true,
+        inner: Inner::CHECK_ALL,
+    };
+
+    /// Validate as *little* as possible about the decoded payload.
+    pub const UNCHECKED: Self = Self {
+        ip_next_protocol: false,
+        inner: Inner::UNCHECKED,
+    };
+}
+
 #[cfg(test)]
 mod tests {
-    use zerocopy::FromBytes;
+    use zerocopy::{FromBytes, IntoBytes};
 
-    use super::Ipv6;
-    use crate::packet::{IpNextProtocol, Ipv6Header};
+    use super::{Ipv6, Ipv6Decoder};
+    use crate::packet::{Decoder, IpNextProtocol, Ipv6Header};
     use std::{net::Ipv6Addr, str::FromStr};
 
     const EXAMPLE_IPV6_ICMP: &[u8] = &[
@@ -154,6 +289,14 @@ mod tests {
         0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
         0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
     ];
+
+    #[test]
+    fn ipv6_decode_and_validate() {
+        let ipv6: &Ipv6 = Ipv6Decoder::CHECK_ALL
+            .decode_ref(EXAMPLE_IPV6_ICMP)
+            .expect("IPv6 packet is valid");
+        assert_eq!(ipv6.as_bytes(), EXAMPLE_IPV6_ICMP);
+    }
 
     #[test]
     fn ipv6_header_layout() {
@@ -179,5 +322,9 @@ mod tests {
             Ipv6Header::LEN + packet.payload.len(),
             EXAMPLE_IPV6_ICMP.len(),
         );
+
+        Ipv6Decoder::CHECK_ALL
+            .decode_ref(EXAMPLE_IPV6_ICMP)
+            .expect("Packet is valid");
     }
 }
