@@ -74,7 +74,7 @@ where
                 }
                 res = actions.recv().fuse() => {
                     let Some((action, machine)) = res else {
-                        log::trace!("DAITA: actions channel closed, exiting handle_actions");
+                        tracing::trace!("DAITA: actions channel closed, exiting handle_actions");
                         let _ = self.end_delay(&mut delayed_packets_buf).await;
                         break;
                     };
@@ -91,7 +91,7 @@ where
             match res {
                 Err(ErrorAction::Close) => return,
                 Err(ErrorAction::Ignore(reason)) => {
-                    log::trace!("Ignoring DAITA action error: {reason}")
+                    tracing::trace!("Ignoring DAITA action error: {reason}")
                 }
                 Ok(()) => {}
             }
@@ -179,7 +179,7 @@ where
         packets: &mut Vec<(Packet, SocketAddr)>,
     ) -> Result<()> {
         let Some(addr) = self.get_peer().await?.endpoint().addr else {
-            log::trace!("No endpoint");
+            tracing::trace!("No endpoint");
             return Err(ErrorAction::Close);
         };
 
@@ -238,8 +238,8 @@ where
             .fetch_add(mtu as usize, atomic::Ordering::SeqCst);
         peer.tunnel
             .encapsulate_with_session(self.create_decoy_packet(mtu))
-            // Encapsulate can only fail when there is no session, just drop the decoy packet in
-            // that case
+            // Encapsulation only fails when there is no usable session (none established, or the
+            // current one hit its message limit); just drop the decoy packet in that case.
             .map_err(|_| ErrorAction::Ignore(IgnoreReason::NoSession))
     }
 

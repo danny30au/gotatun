@@ -24,14 +24,16 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
-use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+use rand::{RngCore, SeedableRng, rngs::StdRng};
 use zerocopy::IntoBytes;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::index_table::IndexTable;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::timers::{MAX_JITTER, TimerName, Timers};
+use crate::noise::timers::{TimerName, Timers};
+
+pub use crate::noise::timers::TimerParams;
 use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 use crate::tun::MtuWatcher;
 use crate::x25519;
@@ -163,6 +165,22 @@ impl<R: RngCore + Send> Tunn<R> {
         }
     }
 
+    /// Update the preshared key used for future handshakes.
+    ///
+    /// The new key is only mixed in by subsequent handshakes. The current
+    /// session therefore keeps working until it is rekeyed, so changing
+    /// the key does not interrupt traffic.
+    // Not invalidating current sessions matches the Linux kernel, which update
+    // the key in place and never tear down the session on a configuration change.
+    pub fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        self.handshake.set_preshared_key(preshared_key);
+    }
+
+    /// Get the current preshared key.
+    pub fn preshared_key(&self) -> Option<[u8; 32]> {
+        self.handshake.preshared_key()
+    }
+
     /// Encapsulate a single packet.
     ///
     /// If there's an active session, return the encapsulated packet. Otherwise, if needed, return
@@ -193,12 +211,13 @@ impl<R: RngCore + Send> Tunn<R> {
 
     /// Encapsulate a single packet into a [`WgData`].
     ///
-    /// Returns `Err(original_packet)` if there is no active session.
+    /// Returns `Err(original_packet)` if there is no active session, or if the active session's
+    /// sending counter has reached `REJECT_AFTER_MESSAGES`.
     pub fn encapsulate_with_session(&mut self, packet: Packet) -> Result<Packet<WgData>, Packet> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(packet);
+            let packet = session.format_packet_data(packet)?;
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !packet.is_keepalive() {
@@ -228,7 +247,7 @@ impl<R: RngCore + Send> Tunn<R> {
         &mut self,
         p: Packet<WgHandshakeInit>,
     ) -> Result<TunnResult, WireGuardError> {
-        log::debug!("Received handshake_initiation: {}", p.sender_idx);
+        tracing::debug!("Received handshake_initiation: {}", p.sender_idx);
 
         let n_bytes = p.as_bytes().len();
         let (packet, session) = self.handshake.receive_handshake_initialization(p)?;
@@ -251,7 +270,7 @@ impl<R: RngCore + Send> Tunn<R> {
         &mut self,
         p: Packet<WgHandshakeResp>,
     ) -> Result<TunnResult, WireGuardError> {
-        log::debug!(
+        tracing::debug!(
             "Received handshake_response: {} {}",
             p.receiver_idx,
             p.sender_idx,
@@ -263,7 +282,9 @@ impl<R: RngCore + Send> Tunn<R> {
         let mut p = p.into_bytes();
         p.truncate(0);
 
-        let keepalive_packet = session.format_packet_data(p);
+        let keepalive_packet = session
+            .format_packet_data(p)
+            .expect("a freshly established session's counter cannot be exhausted");
         // Store new session in next slot
         let slot = self.next_session_slot();
         self.put_session(slot, session);
@@ -272,14 +293,14 @@ impl<R: RngCore + Send> Tunn<R> {
         self.timer_tick_session_established(true, slot); // New session established, we are the initiator
         self.set_current_session(slot);
 
-        log::debug!("Sending keepalive");
+        tracing::debug!("Sending keepalive");
         self.tx_bytes += keepalive_packet.as_bytes().len();
 
         Ok(TunnResult::WriteToNetwork(keepalive_packet.into())) // Send a keepalive as a response
     }
 
     fn handle_cookie_reply(&mut self, p: &WgCookieReply) -> Result<TunnResult, WireGuardError> {
-        log::debug!("Received cookie_reply: {}", p.receiver_idx);
+        tracing::debug!("Received cookie_reply: {}", p.receiver_idx);
 
         self.handshake.receive_cookie_reply(p)?;
         self.timer_tick(TimerName::TimeCookieReceived);
@@ -299,7 +320,7 @@ impl<R: RngCore + Send> Tunn<R> {
                 >= self.timers.session_timers[cur_slot % N_SESSIONS]
         {
             self.current = new_slot;
-            log::trace!("New session slot: {new_slot}");
+            tracing::trace!("New session slot: {new_slot}");
         }
     }
 
@@ -350,7 +371,7 @@ impl<R: RngCore + Send> Tunn<R> {
             .filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
             .find(|(_, s)| s.receiving_index.value() == r_idx)
             .ok_or_else(|| {
-                log::trace!("No session available: {r_idx}");
+                tracing::trace!("No session available: {r_idx}");
                 WireGuardError::NoCurrentSession
             })?;
 
@@ -383,27 +404,22 @@ impl<R: RngCore + Send> Tunn<R> {
         let starting_new_handshake = !self.handshake.is_in_progress();
 
         let packet = self.handshake.format_handshake_initiation();
-        log::debug!("Sending handshake_initiation");
+        tracing::debug!("Sending handshake_initiation");
 
         if starting_new_handshake {
             self.timer_tick(TimerName::TimeLastHandshakeStarted);
         }
         self.timer_tick(TimerName::TimeLastPacketSent);
-        self.update_handshake_jitter();
+        self.update_rekey_timeout();
 
         self.tx_bytes += packet.as_bytes().len();
 
         Some(packet)
     }
 
-    /// Update jitter to apply to the handshake initiation retry timer.
-    fn update_handshake_jitter(&mut self) {
-        self.timers.handshake_jitter = self.next_jitter();
-    }
-
-    /// Calculate a jitter for the handshake initiation retry timer.
-    fn next_jitter(&mut self) -> Duration {
-        self.jitter_rng.random_range(Duration::ZERO..=MAX_JITTER)
+    /// Sample a new deadline for the handshake initiation retry timer.
+    fn update_rekey_timeout(&mut self) {
+        self.timers.rekey_timeout = self.sample_timer(|p| &p.rekey_timeout);
     }
 
     /// Encapsulate and return all queued packets.
@@ -491,7 +507,7 @@ fn pad_to_x16(mut packet: Packet, tun_mtu: &mut MtuWatcher) -> Packet {
         let mtu = usize::from(mtu);
 
         if cfg!(debug_assertions) && packet.len() > mtu {
-            log::debug!("Packet length exceeded MTU: {} > {mtu}", packet.len());
+            tracing::debug!("Packet length exceeded MTU: {} > {mtu}", packet.len());
         }
 
         // Checking the mtu is inherently racey, so we need to be tolerant if packet.len() > mtu.
@@ -575,24 +591,6 @@ mod tests {
         handshake_resp
     }
 
-    fn parse_handshake_resp(
-        tun: &mut Tunn,
-        handshake_resp: Packet<WgHandshakeResp>,
-    ) -> Packet<WgData> {
-        let keepalive = tun.handle_incoming_packet(WgKind::HandshakeResp(handshake_resp));
-        assert!(matches!(keepalive, TunnResult::WriteToNetwork(_)));
-
-        let TunnResult::WriteToNetwork(keepalive) = keepalive else {
-            unreachable!("expected WriteToNetwork")
-        };
-
-        let WgKind::Data(keepalive) = keepalive else {
-            unreachable!("expected WgData, got {keepalive:?}");
-        };
-
-        keepalive
-    }
-
     fn parse_keepalive(tun: &mut Tunn, keepalive: Packet<WgData>) {
         let result = tun.handle_incoming_packet(WgKind::Data(keepalive));
         assert!(matches!(result, TunnResult::WriteToTunnel(p) if p.is_empty()));
@@ -600,12 +598,24 @@ mod tests {
 
     fn create_two_tuns_and_handshake() -> (Tunn, Tunn) {
         let (mut my_tun, mut their_tun) = create_two_tuns();
-        let init = create_handshake_init(&mut my_tun);
-        let resp = create_handshake_response(&mut their_tun, init);
-        let keepalive = parse_handshake_resp(&mut my_tun, resp);
-        parse_keepalive(&mut their_tun, keepalive);
-
+        complete_handshake(&mut my_tun, &mut their_tun);
         (my_tun, their_tun)
+    }
+
+    fn complete_handshake(my_tun: &mut Tunn, their_tun: &mut Tunn) {
+        let result = try_handshake(my_tun, their_tun);
+        let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) = result else {
+            panic!("expected a keepalive packet after the handshake, got {result:?}");
+        };
+        parse_keepalive(their_tun, keepalive);
+    }
+
+    /// Drive a handshake up to the point where the initiator processes the
+    /// response, returning that result so callers can assert success or failure.
+    fn try_handshake(my_tun: &mut Tunn, their_tun: &mut Tunn) -> TunnResult {
+        let init = create_handshake_init(my_tun);
+        let resp = create_handshake_response(their_tun, init);
+        my_tun.handle_incoming_packet(WgKind::HandshakeResp(resp))
     }
 
     fn create_ipv4_udp_packet() -> Packet<Ipv4> {
@@ -738,9 +748,11 @@ mod tests {
     #[test]
     fn full_handshake() {
         let (mut my_tun, mut their_tun) = create_two_tuns();
-        let init = create_handshake_init(&mut my_tun);
-        let resp = create_handshake_response(&mut their_tun, init);
-        let _keepalive = parse_handshake_resp(&mut my_tun, resp);
+        let result = try_handshake(&mut my_tun, &mut their_tun);
+        assert!(
+            matches!(result, TunnResult::WriteToNetwork(WgKind::Data(_))),
+            "expected a keepalive after the handshake, got {result:?}"
+        );
     }
 
     #[test]
@@ -785,25 +797,112 @@ mod tests {
         update_timer_results_in_handshake(&mut my_tun)
     }
 
+    /// The send path must use the last in-limit counter (REJECT_AFTER_MESSAGES - 1) but then
+    /// refuse to encapsulate any more data (which would reuse an AEAD nonce), beginning a fresh
+    /// handshake instead.
+    #[test]
+    fn outgoing_packet_refused_after_message_limit() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+
+        // Fast-forward the established session to its last usable counter value.
+        let slot = my_tun.current % N_SESSIONS;
+        my_tun.sessions[slot]
+            .as_ref()
+            .expect("session established after handshake")
+            .set_sending_key_counter(session::REJECT_AFTER_MESSAGES - 1);
+
+        // The last in-limit packet is still encapsulated and sent.
+        let last = my_tun.handle_outgoing_packet(create_ipv4_udp_packet().into_bytes(), None);
+        assert!(
+            matches!(last, Some(WgKind::Data(_))),
+            "expected the last in-limit packet to be sent, got {last:?}"
+        );
+
+        // The next packet hits the limit: no data is sent, a new handshake begins instead.
+        let over = my_tun.handle_outgoing_packet(create_ipv4_udp_packet().into_bytes(), None);
+        assert!(
+            matches!(over, Some(WgKind::HandshakeInit(_))),
+            "expected a new handshake instead of an encapsulated data packet, got {over:?}"
+        );
+    }
+
     #[test]
     fn one_ip_packet() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+    }
 
-        let sent_packet_buf = create_ipv4_udp_packet();
+    /// Changing the preshared key only affects the next session, never the
+    /// current one. The PSK is not part of the established session's transport
+    /// keys, so traffic keeps flowing even though `their_tun` never learned the
+    /// new key. The next handshake does mix it in, so a one-sided change makes
+    /// the rekey fail to authenticate.
+    #[test]
+    fn set_preshared_key_only_affects_next_session() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
 
-        let data = my_tun
-            .handle_outgoing_packet(sent_packet_buf.clone().into_bytes(), None)
-            .unwrap();
+        // Only one side adopts a new key.
+        my_tun.set_preshared_key(Some([7; 32]));
 
-        assert!(matches!(data, WgKind::Data(..)));
+        // The established session is unaffected and keeps working.
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
 
-        let data = their_tun.handle_incoming_packet(data);
-        let recv_packet_buf = if let TunnResult::WriteToTunnel(recv) = data {
-            recv
-        } else {
-            unreachable!("expected WritetoTunnelV4");
+        // A second handshake needs a strictly newer timestamp than the first.
+        #[cfg(feature = "mock_instant")]
+        MockClock::advance(Duration::from_micros(1));
+
+        // The next handshake mixes in the new key, so the diverged PSK breaks it.
+        let result = try_handshake(&mut my_tun, &mut their_tun);
+        assert!(
+            matches!(result, TunnResult::Err(WireGuardError::InvalidAeadTag)),
+            "expected the rekey to fail on the diverged PSK, got {result:?}"
+        );
+    }
+
+    /// Send one IP packet over the established session and assert it round-trips.
+    fn assert_packet_roundtrip(from: &mut Tunn, to: &mut Tunn) {
+        let sent = create_ipv4_udp_packet();
+        let data = from
+            .handle_outgoing_packet(sent.clone().into_bytes(), None)
+            .expect("session should encrypt the packet");
+        let TunnResult::WriteToTunnel(received) = to.handle_incoming_packet(data) else {
+            panic!("session should decrypt the packet");
         };
-        assert_eq!(sent_packet_buf.as_bytes(), recv_packet_buf.as_bytes());
+        assert_eq!(sent.as_bytes(), received.as_bytes());
+    }
+
+    /// A handshake completes when both sides set the same preshared key.
+    #[test]
+    fn handshake_completes_with_matching_preshared_key() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        my_tun.set_preshared_key(Some([7; 32]));
+        their_tun.set_preshared_key(Some([7; 32]));
+        complete_handshake(&mut my_tun, &mut their_tun);
+    }
+
+    /// A handshake fails to authenticate when only one side set a preshared key.
+    #[test]
+    fn handshake_fails_with_one_sided_preshared_key() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        my_tun.set_preshared_key(Some([7; 32]));
+        let result = try_handshake(&mut my_tun, &mut their_tun);
+        assert!(
+            matches!(result, TunnResult::Err(WireGuardError::InvalidAeadTag)),
+            "expected the handshake to fail on the one-sided PSK, got {result:?}"
+        );
+    }
+
+    /// A handshake fails to authenticate when each side set a different preshared key.
+    #[test]
+    fn handshake_fails_with_different_preshared_key() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        my_tun.set_preshared_key(Some([7; 32]));
+        their_tun.set_preshared_key(Some([4; 32]));
+        let result = try_handshake(&mut my_tun, &mut their_tun);
+        assert!(
+            matches!(result, TunnResult::Err(WireGuardError::InvalidAeadTag)),
+            "expected the handshake to fail on the one-sided PSK, got {result:?}"
+        );
     }
 
     /// Test that [`Tunn::update_timers`] does not panic if clock jumps back.
@@ -908,14 +1007,17 @@ mod tests {
             FixedRng(200),
         );
 
-        let expected_jitter = my_tun.next_jitter();
+        // The FixedRng makes this draw identical to the one made when the handshake is sent.
+        let expected_deadline = my_tun.sample_timer(|p| &p.rekey_timeout);
+        assert!(expected_deadline >= REKEY_TIMEOUT);
+        assert!(expected_deadline <= REKEY_TIMEOUT + MAX_JITTER);
 
-        // Trigger the initial handshake via handle_outgoing_packet, which sets jitter.
+        // Trigger the initial handshake via handle_outgoing_packet, which samples the deadline.
         let packet = create_ipv4_udp_packet();
         let _ = my_tun.handle_outgoing_packet(packet.into_bytes(), None);
 
         // Just before REKEY_TIMEOUT + jitter: no retry yet.
-        MockClock::advance(REKEY_TIMEOUT + expected_jitter - Duration::from_millis(1));
+        MockClock::advance(expected_deadline - Duration::from_millis(1));
         assert!(
             matches!(my_tun.update_timers(), Ok(None)),
             "retry should not fire before REKEY_TIMEOUT + jitter"
@@ -927,6 +1029,68 @@ mod tests {
             matches!(my_tun.update_timers(), Ok(Some(WgKind::HandshakeInit(..)))),
             "retry should fire at REKEY_TIMEOUT + jitter"
         );
+    }
+
+    /// Verify that custom [`TimerParams`] move the rekey-after-time and passive keepalive
+    /// deadlines.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn custom_timer_params_applied() {
+        const REKEY_AFTER: Duration = Duration::from_secs(100);
+        const KEEPALIVE: Duration = Duration::from_secs(8);
+        // Far enough away to never interfere with the deadlines under test.
+        const NEW_HANDSHAKE: Duration = Duration::from_secs(1000);
+        const MS: Duration = Duration::from_millis(1);
+
+        MockClock::set_time(Duration::ZERO);
+
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        my_tun.dangerously_set_timer_params(TimerParams {
+            keepalive_timeout: KEEPALIVE..=KEEPALIVE,
+            new_handshake_timeout: NEW_HANDSHAKE..=NEW_HANDSHAKE,
+            rekey_after_time: REKEY_AFTER..=REKEY_AFTER,
+            ..TimerParams::default()
+        });
+
+        complete_handshake(&mut my_tun, &mut their_tun);
+
+        // Receive a data packet at t = 1 s without answering. The passive keepalive
+        // should fire KEEPALIVE (rather than the default 10 s) after the data arrived.
+        MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+
+        let sent_packet_buf = create_ipv4_udp_packet();
+        let data = their_tun
+            .handle_outgoing_packet(sent_packet_buf.into_bytes(), None)
+            .expect("expected encapsulated packet");
+        let _ = my_tun.handle_incoming_packet(data);
+
+        MockClock::advance(KEEPALIVE - MS);
+        assert!(
+            matches!(my_tun.update_timers(), Ok(None)),
+            "keepalive should not fire before the custom timeout"
+        );
+        MockClock::advance(MS);
+        assert!(
+            matches!(my_tun.update_timers(), Ok(Some(WgKind::Data(p))) if p.is_keepalive()),
+            "keepalive should fire at the custom timeout"
+        );
+
+        // Send a data packet on the aging session (t = 1 s + KEEPALIVE). As the initiator,
+        // we should start a new handshake REKEY_AFTER (rather than the default 120 s) after
+        // session establishment (t = 0).
+        let sent_packet_buf = create_ipv4_udp_packet();
+        let _ = my_tun
+            .handle_outgoing_packet(sent_packet_buf.into_bytes(), None)
+            .expect("expected encapsulated packet");
+
+        MockClock::advance(REKEY_AFTER - KEEPALIVE - Duration::from_secs(1) - MS);
+        assert!(
+            matches!(my_tun.update_timers(), Ok(None)),
+            "rekey should not fire before the custom rekey-after-time"
+        );
+        MockClock::advance(MS);
+        update_timer_results_in_handshake(&mut my_tun);
     }
 
     /// Verify that a received keepalive is not answered with a passive keepalive.

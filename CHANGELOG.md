@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- Replace `log` with `tracing`.
+
+
+## [0.7.2] - 2026-06-25
+### Added
+- Add `noise::TimerParams` for tuning WireGuard timers. This is useful for obfuscation, but note
+  that tweaking timers will cause the tunnel to deviate from the WireGuard spec.
+- Implement `AsRef<[u8]>` for `Packet<[u8]>`
+
+### Changed
+- Enlarge the anti-replay sliding window from 1024 to 8192 packets, matching the
+  Linux kernel and wireguard-go. Tolerates more packet reordering before dropping
+  legitimate packets. Costs ~7 KiB more memory per peer.
+- Bump minimum supported Rust version to 1.95.
+
 ### Fixed
 - Add missing jitter for handshakes initiated due to not receiving any packets.
 - Passive keepalives were triggered by received keepalives, not just non-empty data packets. This
@@ -13,14 +29,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The passive keepalive timer was relative to the *last sent packet*. This meant that an idle tunnel
   receiving a packet would instantly send a keepalive (instead of waiting for `KEEPALIVE-TIMEOUT`).
 - Do not send persistent keepalives if tunnel is active.
+- Propagate preshared-key (PSK) changes to the tunnel. Changing a peer's preshared key via
+  `DeviceWrite::modify_peer`/`update_peer` updated the stored config but not the noise state, so
+  handshakes kept using the old key. The new key now takes effect on the next handshake without
+  tearing down the live session, matching the Linux kernel and wireguard-go.
 
 ### Security
+- Enforce the `Reject-After-Messages` limit on the transport data counter, so a
+  session is retired before its AEAD nonce can wrap and repeat.
+
 #### Linux
 - Fix a remotely triggerable denial of service in the `recvmmsg` receive path.
   An oversized incoming UDP datagram (larger than the receive buffer) panicked
   the receive task, halting all UDP reception. Both single datagrams and
   GRO-coalesced segments were affected. The receive buffer now grows to fit
   them instead.
+- Fix a bug in the validation of allowed IPs for incoming packets. Peers could
+  send packets with an IP belonging to another, if the allowed IPs of the second
+  was a subnet of the first.
 
 
 ## [0.7.1] - 2026-05-26
