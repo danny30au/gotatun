@@ -6,12 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+
+## [0.8.1] - 2026-07-14
+### Added
+- Make the `UdpSocket::socket` method public, exposing the inner `tokio::net::UdpSocket`.
+
+### Fixed
+#### Windows
+- Exit when TUN read fails due to `ERROR_HANDLE_EOF`.
+
+
+## [0.8.0] - 2026-07-09
+### Added
+- `Device::suspend` and `Device::resume` to pause and resume all tunnel activity.
+  Suspending stops the timers, inbound, and outbound tasks (no keepalives, handshakes,
+  or data), while retaining peers and config. Resuming rebuilds the connection and
+  forces a fresh handshake. Intended for platforms such as iOS where I/O can be
+  cooperatively suspended for lower power use.
+
 ### Changed
 - Replace `log` with `tracing`.
+
+### Removed
+- Remove `AsFd` implementation for `UdpSocket`.
 
 ### Fixed
 - Do not update peer endpoint/roam on received cookie replies.
   This change is made to be consistent with Linux kernel and wireguard-go.
+- Continue with IPv4-only UDP transport on Linux when IPv6 sockets are unavailable.
 
 
 ## [0.7.2] - 2026-06-25
