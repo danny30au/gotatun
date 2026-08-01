@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Add `PacketBufPool::new_lazy`, which creates a packet pool without initializing any
+  buffers. New packet buffers will be allocated lazily as required when
+  `PacketBufPool::get` is called.
+
+### Changed
+- Hide native UDP socket impls behind new `socket` feature.
+
+### Fixed
+- Keep IPv4 fragments for different protocols in separate reassembly buffers.
+- Send persistent keepalive immediately on peer activation, instead of waiting for one full
+  interval. This matches wireguard-go and Linux kernel wireguard.
 
 
 ## [0.8.1] - 2026-07-14
