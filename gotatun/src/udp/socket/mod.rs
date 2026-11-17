@@ -173,7 +173,7 @@ impl UdpSocket {
     }
 
     /// Map an IPv4 address to IPv6 if necessary.
-    #[cfg(any(target_os = "windows", target_vendor = "apple"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[inline(always)]
     fn map_dst(&self, mut addr: SocketAddr) -> SocketAddr {
         if self.map_ipv4_to_ipv6
@@ -230,7 +230,7 @@ fn is_ipv6_unavailable(err: &io::Error) -> bool {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
 fn check_send_max_number_of_packets(
     max_number_of_packets: usize,
     packets: &[(crate::packet::Packet, SocketAddr)],
@@ -283,6 +283,9 @@ mod tests {
         {
             use std::os::fd::{AsRawFd, FromRawFd};
             let raw_fd = dual_sock.socket().as_raw_fd();
+            // SAFETY:
+            // - raw_socket is an [owned socket](https://doc.rust-lang.org/stable/std/io/index.html#io-safety).
+            // - raw_socket is open.
             let socket2 = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
             assert!(!socket2.only_v6().unwrap());
             std::mem::forget(socket2); // Don't close the socket
@@ -291,12 +294,16 @@ mod tests {
         {
             use std::os::windows::io::{AsRawSocket, FromRawSocket};
             let raw_socket = dual_sock.socket().as_raw_socket();
+            // SAFETY:
+            // - raw_socket is an [owned socket](https://doc.rust-lang.org/stable/std/io/index.html#io-safety).
+            // - raw_socket is open.
+            // - raw_socket may be freed via [`closesocket`](https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-closesocket).
             let socket2 = unsafe { socket2::Socket::from_raw_socket(raw_socket) };
             assert!(!socket2.only_v6().unwrap());
             std::mem::forget(socket2); // Don't close the socket
         }
 
-        // Bind two new sockets for receving packets from `dual_sock`
+        // Bind two new sockets for receiving packets from `dual_sock`
         let bind = async |addr: IpAddr| tokio::net::UdpSocket::bind((addr, 0)).await.unwrap();
         let v4 = bind(Ipv4Addr::LOCALHOST.into()).await;
         let v6 = bind(Ipv6Addr::LOCALHOST.into()).await;

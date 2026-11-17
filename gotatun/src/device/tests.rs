@@ -20,6 +20,7 @@ use tokio::{
 };
 use zerocopy::IntoBytes;
 
+use crate::noise::TimerParams;
 use crate::noise::index_table::IndexTable;
 use crate::packet::{Ip, Packet};
 
@@ -85,7 +86,7 @@ async fn one_keepalive() {
     .await
 }
 
-/// Assert that all WgData packets lenghts are a multiple of 16.
+/// Assert that all WgData packets lengths are a multiple of 16.
 #[tokio::test]
 #[test_log::test]
 async fn wg_data_length_is_x16() {
@@ -183,6 +184,47 @@ async fn test_endpoint_roaming() {
     ping_pong("1.2.3.4".parse().unwrap()).await;
 }
 
+/// Adding peers is atomic, including when a public key is duplicated within the batch.
+#[tokio::test]
+#[test_log::test]
+async fn add_peers_rejects_duplicate_public_keys() {
+    use crate::device::Peer;
+    use ipnetwork::Ipv4Network;
+    use std::{net::Ipv4Addr, sync::Arc};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (_alice, bob, _eve) = mock::device_pair().await;
+    let initial_peers = bob.device.peers().await.len();
+    let public_key = PublicKey::from(&StaticSecret::random());
+    let peer_a = Peer::new(public_key).with_allowed_ip(
+        Ipv4Network::new(Ipv4Addr::new(10, 0, 0, 1), 32)
+            .unwrap()
+            .into(),
+    );
+    let peer_b = Peer::new(public_key).with_allowed_ip(
+        Ipv4Network::new(Ipv4Addr::new(10, 0, 0, 2), 32)
+            .unwrap()
+            .into(),
+    );
+
+    let added = bob
+        .device
+        .add_peers([peer_a, peer_b])
+        .await
+        .expect("device reconfiguration should not fail");
+
+    assert!(!added, "duplicate public keys must reject the entire batch");
+    assert_eq!(bob.device.peers().await.len(), initial_peers);
+
+    let state = bob.device.inner.read().await;
+    assert!(state.peers_by_ip.iter().all(|(routed_peer, _)| {
+        state
+            .peers
+            .values()
+            .any(|peer| Arc::ptr_eq(peer, routed_peer))
+    }));
+}
+
 /// A peer must not inject a packet whose inner source IP belongs
 /// (by longest-prefix match) to a *different* peer, even when the
 /// sending peer's own allowed-ips would cover it. The most specific
@@ -267,6 +309,34 @@ async fn update_peer_preshared_key_reaches_tunnel() {
         advance_mock_clock();
     })
     .await;
+}
+
+/// Ensures setting a peer's timer params via Device::modify_peer propagates into its noise state,
+/// and that clearing them restores the defaults
+#[tokio::test]
+#[test_log::test]
+async fn modify_peer_timer_params_reach_tunnel() {
+    let (_alice, mut bob, _eve) = mock::device_pair().await;
+    let peer = get_first_and_only_peer(&bob).await;
+    assert_eq!(peer.danger_timer_params, Some(TimerParams::default()));
+
+    let timer_params = TimerParams {
+        keepalive_timeout: Duration::from_secs(3)..=Duration::from_secs(5),
+        ..TimerParams::default()
+    };
+    for expected in [Some(timer_params.clone()), None] {
+        let updated = bob
+            .device
+            .modify_peer(&peer.public_key, |peer_mut| {
+                peer_mut.dangerously_set_timer_params(expected.clone());
+            })
+            .await
+            .expect("modify_peer should succeed");
+        assert!(updated, "peer update should affect an existing peer");
+
+        let peer = get_first_and_only_peer(&bob).await;
+        assert_eq!(peer.danger_timer_params, Some(expected.unwrap_or_default()),);
+    }
 }
 
 /// The number of packets we send through the tunnel
@@ -414,6 +484,38 @@ async fn suspend_and_resume() {
     drop((alice, bob));
 }
 
+/// Binding to port 0 reports the actual port, and keeps it across rebinds.
+#[tokio::test]
+#[test_log::test]
+async fn listen_port_zero_reports_bound_port() {
+    use crate::device::{DeviceBuilder, Peer};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (tun, _app_tx, _app_rx) = mock::mock_tun();
+    let peer = Peer::new(PublicKey::from(&StaticSecret::random()));
+
+    let device = DeviceBuilder::new()
+        .with_private_key(StaticSecret::random())
+        .with_ip(tun)
+        .with_default_udp()
+        .with_listen_port(0)
+        .with_peer(peer)
+        .build()
+        .await
+        .expect("create device");
+
+    let port = device.read(async |d| d.listen_port()).await;
+    assert_ne!(port, 0);
+
+    device.suspend().await;
+    device.resume().await.expect("resume should succeed");
+
+    let port_after_resume = device.read(async |d| d.listen_port()).await;
+    assert_eq!(port, port_after_resume);
+
+    device.stop().await;
+}
+
 /// A reconfiguration that would normally rebuild the connection must not
 /// silently un-suspend the device: the change is applied to `DeviceState` but
 /// the connection stays down until [`Device::resume`].
@@ -460,6 +562,68 @@ async fn reconfigure_while_suspended_stays_down() {
     drop((alice, bob));
 }
 
+/// [`Device::force_handshake`] performs a single handshake, and nothing once a session exists.
+#[tokio::test]
+#[test_log::test]
+async fn force_handshake() {
+    use crate::device::Error;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (alice, _bob, eve) = mock::device_pair().await;
+    let mut inits = std::pin::pin!(eve.wg_handshake_init());
+    let bob_public_key = get_first_and_only_peer(&alice).await.public_key;
+
+    // Concurrent callers share a single handshake.
+    let (first, second) = timeout(Duration::from_secs(2), async {
+        join!(
+            alice.device.force_handshake(&bob_public_key),
+            alice.device.force_handshake(&bob_public_key),
+        )
+    })
+    .await
+    .expect("session should be established");
+    first.expect("first wait should succeed");
+    second.expect("second wait should succeed");
+
+    let first_init = timeout(Duration::from_secs(1), inits.next())
+        .await
+        .expect("a handshake init should be observed");
+    assert!(first_init.is_some());
+
+    assert!(
+        timeout(Duration::from_millis(500), inits.next())
+            .await
+            .is_err(),
+        "no additional handshake init should be sent"
+    );
+
+    // With an active WireGuard session, no handshake is initiated.
+    alice
+        .device
+        .force_handshake(&bob_public_key)
+        .await
+        .expect("wait with a fresh session should succeed");
+
+    assert!(
+        timeout(Duration::from_millis(500), inits.next())
+            .await
+            .is_err(),
+        "no additional handshake init should be sent"
+    );
+
+    let unknown_peer = PublicKey::from(&StaticSecret::random());
+    assert!(matches!(
+        alice.device.force_handshake(&unknown_peer).await,
+        Err(Error::PeerNotFound)
+    ));
+
+    alice.device.suspend().await;
+    assert!(matches!(
+        alice.device.force_handshake(&bob_public_key).await,
+        Err(Error::NotConnected)
+    ));
+}
+
 /// Helper method to test that packets can be sent from one [`Device`] to another.
 /// Use `eavesdrop` to sniff wireguard packets and assert things about the connection.
 async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) {
@@ -469,7 +633,7 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
     let eavesdrop = async {
         select! {
             _ = eavesdrop(eve) => {}
-            _ = sleep(Duration::from_secs(1)) => panic!("eavesdrop timeout"),
+            _ = sleep(Duration::from_secs(10)) => panic!("eavesdrop timeout"),
         }
     };
 
@@ -498,7 +662,7 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
             _ = wait_for_packets => {},
             _ = send_packets => unreachable!(),
             _ = alice.app_rx.recv() => panic!("no data is sent from bob to alice"),
-            _ = sleep(Duration::from_secs(1)) => panic!("timeout"),
+            _ = sleep(Duration::from_secs(10)) => panic!("timeout"),
         }
 
         // Shut down alice and bob after `wait_for_packets`

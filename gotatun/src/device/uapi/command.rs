@@ -590,7 +590,9 @@ impl FromStr for Set {
                     })
                 }
 
-                _ => bail!("Key {k:?} in {line:?} is not allowed in command set"),
+                _ => {
+                    bail!("Key {k:?} in {line:?} is not allowed in command set");
+                }
             }
         }
 
@@ -657,7 +659,9 @@ impl SetPeer {
                 #[cfg(feature = "daita-uapi")]
                 _ if matches!(try_process_daita_line(daita_settings, k, v), Ok(true)) => (),
 
-                _ => bail!("Key {k:?} in {line:?} is not allowed in command set/peer"),
+                _ => {
+                    bail!("Key {k:?} in {line:?} is not allowed in command set/peer");
+                }
             }
 
             // advance the iterator *after* we make sure we want to consume the line
@@ -749,7 +753,9 @@ impl FromStr for Request {
         Ok(match first_line {
             "set=1" => Set::from_str(s)?.into(),
             "get=1" => Get::from_str(s)?.into(),
-            _ => bail!("Unknown command: {s:?}"),
+            _ => {
+                bail!("Unknown command: {s:?}");
+            }
         })
     }
 }

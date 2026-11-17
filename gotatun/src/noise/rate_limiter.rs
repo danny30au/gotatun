@@ -16,12 +16,17 @@ use crate::noise::{TunnResult, WireGuardError};
 use crate::packet::{Packet, WgCookieReply, WgHandshakeBase, WgKind};
 
 use constant_time_eq::constant_time_eq;
+use gotatun_crypto::x25519;
 #[cfg(feature = "mock_instant")]
 use mock_instant::thread_local::Instant;
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use rand::TryRngCore;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[cfg(not(feature = "mock_instant"))]
@@ -78,7 +83,7 @@ impl RateLimiter {
     ///
     /// * `public_key` - The device's public key, used for cookie generation
     /// * `limit` - Maximum number of packets allowed per rate limiting period
-    pub fn new(public_key: &crate::x25519::PublicKey, limit: u64) -> Self {
+    pub fn new(public_key: &x25519::PublicKey, limit: u64) -> Self {
         let mut secret_key = [0u8; 16];
         OsRng.try_fill_bytes(&mut secret_key).unwrap();
         RateLimiter {

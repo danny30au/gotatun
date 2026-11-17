@@ -49,7 +49,7 @@ impl BufferedUdpSend {
             let mut send_many_buf = Default::default();
 
             loop {
-                // use seperate channels because we musn't call `send_many_to` with mixed IPv4/IPv6.
+                // use separate channels because we musn't call `send_many_to` with mixed IPv4/IPv6.
                 let (count, buf) = select! {
                     // recv_many is cancel-safe
                     n = send_rx_v4.recv_many(&mut buf_v4, max_packet_count).fuse() => (n, &mut buf_v4),
@@ -120,7 +120,7 @@ impl UdpSend for BufferedUdpSend {
 /// buffer is empty.
 pub struct BufferedUdpReceive {
     _recv_task: Arc<Task>,
-    recv_rx: mpsc::Receiver<(Packet, SocketAddr)>,
+    recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
 }
 
 impl BufferedUdpReceive {
@@ -130,7 +130,7 @@ impl BufferedUdpReceive {
         mut udp_rx: impl UdpRecv + 'static,
         mut recv_pool: PacketBufPool,
     ) -> Self {
-        let (recv_tx, recv_rx) = mpsc::channel::<(Packet, SocketAddr)>(capacity);
+        let (recv_tx, recv_rx) = mpsc::channel(capacity);
 
         let recv_task = Task::spawn("buffered UDP receive", async move {
             let mut recv_many_buf = Default::default();
@@ -138,19 +138,19 @@ impl BufferedUdpReceive {
 
             loop {
                 // Read packets from the socket.
-                let Ok(()) = udp_rx
+                if let Err(err) = udp_rx
                     .recv_many_from(&mut recv_many_buf, &mut recv_pool, &mut packet_bufs)
                     .await
-                else {
-                    // TODO
+                {
+                    let _ = recv_tx.send(Err(err)).await;
                     return;
-                };
+                }
 
                 for (packet_buf, src) in packet_bufs.drain(..) {
-                    match recv_tx.try_send((packet_buf, src)) {
+                    match recv_tx.try_send(Ok((packet_buf, src))) {
                         Ok(()) => (),
-                        Err(mpsc::error::TrySendError::Full((packet_buf, addr))) => {
-                            if recv_tx.send((packet_buf, addr)).await.is_err() {
+                        Err(mpsc::error::TrySendError::Full(packet)) => {
+                            if recv_tx.send(packet).await.is_err() {
                                 // Buffer dropped
                                 return;
                             }
@@ -172,9 +172,38 @@ impl UdpRecv for BufferedUdpReceive {
     type RecvManyBuf = ();
 
     async fn recv_from(&mut self, _pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
-        let Some((rx_packet, src)) = self.recv_rx.recv().await else {
-            return Err(io::Error::other("No packet available"));
+        let Some(packet) = self.recv_rx.recv().await else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "UDP receive task stopped",
+            ));
         };
-        Ok((rx_packet, src))
+        packet
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod test {
+    use super::*;
+    use crate::udp::socket::{SockOpt, UdpSocket};
+
+    #[tokio::test]
+    /// Regression test for security advisory GHSA-6gxq-8xp9-742r.
+    async fn empty_loopback_datagram_mustnt_stop_buffered_udp_receive() {
+        let socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap(), SockOpt::default()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let mut receiver = BufferedUdpReceive::new(16, socket, PacketBufPool::new(16));
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        sender.send_to(&[], addr).unwrap();
+        sender.send_to(b"after-empty", addr).unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            receiver.recv_from(&mut PacketBufPool::new(1)),
+        )
+        .await
+        .expect("the receive task must stop promptly")
+        .expect("the panicked receive task must not close its channel");
     }
 }

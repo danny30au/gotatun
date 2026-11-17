@@ -36,7 +36,7 @@ use crate::noise::timers::{TimerName, Timers};
 pub use crate::noise::timers::TimerParams;
 use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 use crate::tun::MtuWatcher;
-use crate::x25519;
+use gotatun_crypto::x25519;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -696,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    // Verify that a valid hanshake is accepted by two linked peers when rate limiting is not
+    // Verify that a valid handshake is accepted by two linked peers when rate limiting is not
     // applied.
     fn verify_handshake() {
         let (mut my_tun, mut their_tun) = create_two_tuns();
@@ -759,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    // Verify that an invalid hanshake is rejected by both linked peers.
+    // Verify that an invalid handshake is rejected by both linked peers.
     fn reject_handshake() {
         let (mut my_tun, mut their_tun) = create_two_tuns();
         let mut init = create_handshake_init(&mut my_tun);

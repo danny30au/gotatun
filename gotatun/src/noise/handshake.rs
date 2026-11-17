@@ -10,19 +10,19 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::crypto::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use crate::noise::errors::WireGuardError;
 use crate::noise::index_table::{Index, IndexTable};
 use crate::noise::session::Session;
 use crate::packet::{Packet, WgCookieReply, WgHandshakeBase, WgHandshakeInit, WgHandshakeResp};
 #[cfg(not(feature = "mock_instant"))]
 use crate::sleepyinstant::Instant;
-use crate::x25519;
 use aead::{Aead, Payload};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::XChaCha20Poly1305;
 use constant_time_eq::constant_time_eq_n;
+use gotatun_crypto::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+use gotatun_crypto::x25519;
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
 use zerocopy::IntoBytes;
@@ -153,7 +153,7 @@ fn aead_chacha20_open_inner(
     nonce: [u8; 12],
     data: &[u8],
     aad: &[u8],
-) -> Result<(), crate::crypto::error::Unspecified> {
+) -> Result<(), gotatun_crypto::error::Unspecified> {
     let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).unwrap());
 
     let mut inner_buffer = data.to_owned();
@@ -196,7 +196,8 @@ impl TimeStamper {
 
     /// Take time reading and generate a 12 byte timestamp
     pub fn stamp(&self) -> [u8; 12] {
-        const TAI64_BASE: u64 = (1u64 << 62) + 37;
+        // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/wireguard/noise.c#n512
+        const TAI64_BASE: u64 = 0x4000_0000_0000_000a;
         let mut ext_stamp = [0u8; 12];
         let stamp = Instant::now().duration_since(self.instant_at_start) + self.duration_at_start;
         ext_stamp[0..8].copy_from_slice(&(stamp.as_secs() + TAI64_BASE).to_be_bytes());

@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- Add `gotatun-packet` module.
+- Add `gotatun-crypto` module.
+
+
+## [0.10.3] - 2026-11-09
+### Fixed
+- Fix `AtomicU64` build errors on targets without native 64-bit atomics,
+  such as MIPS32.
+- Use the TAI64N base `2^62 + 10` for handshake timestamps. The previous `2^62 + 37` ran 27 seconds
+  ahead, so a responder that had seen a GotaTun handshake rejected the next kernel or wireguard-go
+  initiation with the same key as a replay for up to 27 seconds.
+
+
+## [0.10.2] - 2026-10-20
+### Added
+- Add `PeerMut::dangerously_set_timer_params`, so that timer params can be changed
+  for an existing peer.
+
+
+## [0.10.1] - 2026-10-16
+### Fixed
+- Fix IP counts not resetting periodically for devices without registered peers.
+#### Linux
+- Fix panic upon reading an empty UDP datagram if UDP GRO optimizations were enabled.
+  The panic would terminates the device's shared UDP receive task, denying inbound traffic for
+  every peer on that device until it was restarted or reconfigured.
+
+
+## [0.10.0] - 2026-10-14
+### Added
+- Add `Device::force_handshake` to establish a WireGuard session for a peer.
+
+### Fixed
+- Bind the UAPI unix socket at `/var/run/wireguard/<name>.sock` without a doubled
+  slash in the path. The kernel previously reported the bound path as
+  `/var/run/wireguard//<name>.sock`, which broke exact-path lookups such as
+  `lsof /var/run/wireguard/<name>.sock`.
+- Apply the dual-stack address mapping on every target served by the generic UDP
+  socket implementation, not only Apple targets. Sending to an IPv4 peer on a
+  dual-stack socket previously failed with `EAFNOSUPPORT` on those targets, and
+  received datagrams reported an unmapped `::ffff:` source address.
+- Report UDP receive failures as fatal device errors. The inbound task previously
+  stopped silently on such failures, so `Device::wait` was never woken and the
+  device stopped receiving without any indication.
+- When `listen_port` is 0, `DeviceRead::listen_port` and UAPI `get` report the
+  actually assigned port instead of 0. That port is also kept across suspend/resume
+  and other rebinds.
+
+#### iOS
+- Stop compiling `check_send_max_number_of_packets` on targets that never call it.
+
+### Security
+#### Windows
+- Fix a remotely triggerable denial of service in the UDP receive path used
+  without the `windows-gro` feature. A single unauthenticated UDP datagram larger
+  than the 4096-byte receive buffer stopped the receive task, halting inbound
+  traffic for every peer on the device until the connection was rebuilt.
+  Oversized datagrams are now discarded and reception continues.
+
+
+## [0.9.2] - 2026-08-31
+### Fixed
+#### Windows
+- Allow the `device` feature to build without the `tun` feature.
+
+
+## [0.9.1] - 2026-08-27
+### Fixed
+- Reject IPv4 fragment sets containing data beyond a terminal fragment.
+- Reject duplicate peer public keys in device builders, batch additions, and UAPI requests.
+#### Windows
+- Identify fatal `wintun-bindings` errors for TUN read/write.
+
+
+## [0.8.2] - 2026-08-26
+### Fixed
+#### Windows
+- Identify fatal `wintun-bindings` errors for TUN read/write.
+
+
+## [0.9.0] - 2026-08-18
+### Added
 - Add `PacketBufPool::new_lazy`, which creates a packet pool without initializing any
   buffers. New packet buffers will be allocated lazily as required when
   `PacketBufPool::get` is called.

@@ -45,6 +45,7 @@ use eyre::{Context, bail, eyre};
 use libc::EINVAL;
 #[cfg(unix)]
 use nix::unistd::{Gid, Uid};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::str::FromStr;
@@ -55,7 +56,7 @@ use std::time::SystemTime;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 #[cfg(unix)]
-const SOCK_DIR: &str = "/var/run/wireguard/";
+const SOCK_DIR: &str = "/var/run/wireguard";
 
 /// A server that receives [`Request`]s. Should be passed to [`DeviceBuilder::with_uapi`].
 ///
@@ -535,12 +536,7 @@ async fn on_api_get(_: Get, d: &DeviceState<impl DeviceTransports>) -> GetRespon
 
     GetResponse {
         private_key: d.key_pair.as_ref().map(|k| KeyBytes(k.0.to_bytes())),
-        listen_port: Some(
-            d.connection
-                .as_ref()
-                .and_then(|con| con.listen_port)
-                .unwrap_or(0),
-        ),
+        listen_port: Some(d.port),
         fwmark: d.fwmark,
         peers,
         errno: 0,
@@ -552,21 +548,18 @@ async fn on_api_set(
     set: Set,
     device: &mut DeviceState<impl DeviceTransports>,
 ) -> (SetResponse, Reconfigure) {
+    if let Err(errno) = validate_set(&set) {
+        return (SetResponse { errno }, Reconfigure::No);
+    }
+
     let Set {
         private_key,
         listen_port,
         fwmark,
         replace_peers,
-        protocol_version,
+        protocol_version: _,
         peers,
     } = set;
-
-    if let Some(protocol_version) = protocol_version
-        && protocol_version != "1"
-    {
-        tracing::warn!("Invalid API protocol version: {protocol_version}");
-        return (SetResponse { errno: EINVAL }, Reconfigure::No);
-    }
 
     let mut reconfigure: Reconfigure = Reconfigure::No;
 
@@ -701,6 +694,44 @@ async fn on_api_set(
     }
 
     (SetResponse { errno: 0 }, reconfigure)
+}
+
+fn validate_set(set: &Set) -> Result<(), i32> {
+    if let Some(protocol_version) = &set.protocol_version
+        && protocol_version != "1"
+    {
+        tracing::warn!("Invalid API protocol version: {protocol_version}");
+        return Err(EINVAL);
+    }
+
+    let mut public_keys = HashSet::with_capacity(set.peers.len());
+    if set
+        .peers
+        .iter()
+        .any(|peer| !public_keys.insert(peer.peer.public_key.0))
+    {
+        tracing::warn!("A peer public key was specified more than once");
+        return Err(EINVAL);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EINVAL, validate_set};
+    use crate::{device::uapi::command::SetPeer, serialization::KeyBytes};
+
+    #[test]
+    fn rejects_duplicate_peer_public_keys() {
+        let public_key = KeyBytes([1; 32]);
+        let set = super::Set {
+            peers: vec![SetPeer::new(public_key.0), SetPeer::new(public_key.0)],
+            ..Default::default()
+        };
+
+        assert_eq!(validate_set(&set), Err(EINVAL));
+    }
 }
 
 #[cfg(windows)]

@@ -10,13 +10,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Configuration and inspection interface for WireGuard devices.
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use ipnetwork::IpNetwork;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::device::Error;
 use crate::device::{Connection, Device, DeviceState, DeviceTransports, Peer, Reconfigure};
+use crate::noise::TimerParams;
 
 /// Read-only view of a WireGuard device for inspection.
 ///
@@ -94,6 +95,7 @@ pub struct PeerMut {
     preshared_key: Update<[u8; 32]>,
     endpoint: Update<SocketAddr>,
     keepalive: Update<u16>,
+    timer_params: Update<TimerParams>,
 
     clear_allowed_ips: bool,
     add_allowed_ips: Vec<IpNetwork>,
@@ -113,6 +115,14 @@ impl PeerMut {
     /// Set or clear the persistent keepalive interval (in seconds) for this peer.
     pub fn set_keepalive(&mut self, keepalive: Option<u16>) {
         self.keepalive = keepalive.into();
+    }
+
+    /// Override the WireGuard timer deadlines for this peer, or restore the defaults with `None`.
+    ///
+    /// Any deadlines sampled from the previous timer params are reset. An established session is
+    /// kept. See [`TimerParams`].
+    pub fn dangerously_set_timer_params(&mut self, timer_params: Option<TimerParams>) {
+        self.timer_params = timer_params.into();
     }
 
     /// Clear all allowed IPs for this peer.
@@ -226,15 +236,16 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
 
     /// Add multiple new peers to this [`Device`].
     ///
-    /// If _any_ new peer has the same public key as an existing peer, no new peers are added
-    /// and this function returns `false`. See also [`Self::add_or_update_peers`].
+    /// If _any_ new peer has the same public key as an existing peer or another peer in the batch,
+    /// no new peers are added and this function returns `false`. See also
+    /// [`Self::add_or_update_peers`].
     pub fn add_peers(&mut self, peers: impl IntoIterator<Item = Peer>) -> bool {
         let peers: Vec<_> = peers.into_iter().collect();
+        let mut public_keys = HashSet::with_capacity(peers.len());
 
-        if peers
-            .iter()
-            .any(|peer| self.device.peers.contains_key(&peer.public_key))
-        {
+        if peers.iter().any(|peer| {
+            !public_keys.insert(peer.public_key) || self.device.peers.contains_key(&peer.public_key)
+        }) {
             return false;
         }
 
@@ -301,7 +312,7 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
     pub async fn modify_peer(
         &mut self,
         public_key: &PublicKey,
-        f: impl for<'a> FnOnce(&mut PeerMut),
+        f: impl FnOnce(&mut PeerMut),
     ) -> bool {
         let Some(existing_peer) = self.device.peers.get(public_key) else {
             return false;
@@ -319,6 +330,7 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
             add_allowed_ips,
             endpoint,
             keepalive,
+            timer_params,
         } = peer_mut;
 
         if let Update::Set(preshared_key) = preshared_key {
@@ -327,6 +339,12 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
 
         if let Update::Set(keepalive) = keepalive {
             existing_peer.tunnel.set_persistent_keepalive(keepalive);
+        }
+
+        if let Update::Set(timer_params) = timer_params {
+            existing_peer
+                .tunnel
+                .dangerously_set_timer_params(timer_params.unwrap_or_default());
         }
 
         if let Update::Set(addr) = endpoint {
@@ -510,8 +528,9 @@ impl<T: DeviceTransports> Device<T> {
 
     /// Add multiple new peers to this [`Device`].
     ///
-    /// If _any_ new peer has the same public key as an existing peer, no new peers are added
-    /// and this function returns `false`. See also [`Self::add_or_update_peers`].
+    /// If _any_ new peer has the same public key as an existing peer or another peer in the batch,
+    /// no new peers are added and this function returns `false`. See also
+    /// [`Self::add_or_update_peers`].
     pub async fn add_peers(&self, peers: impl IntoIterator<Item = Peer>) -> Result<bool, Error> {
         self.write(async |device| device.add_peers(peers)).await
     }
@@ -561,7 +580,7 @@ impl<T: DeviceTransports> Device<T> {
     pub async fn modify_peer(
         &mut self,
         public_key: &PublicKey,
-        f: impl for<'a> FnOnce(&mut PeerMut),
+        f: impl FnOnce(&mut PeerMut),
     ) -> Result<bool, Error> {
         self.write(async |device| device.modify_peer(public_key, f).await)
             .await

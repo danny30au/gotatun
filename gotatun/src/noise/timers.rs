@@ -293,7 +293,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
         for (i, t) in timers.session_timers.iter_mut().enumerate() {
             if time_now - *t > REJECT_AFTER_TIME {
-                // Forget about expired sesssions
+                // Forget about expired sessions
                 if let Some(session) = self.sessions[i].take() {
                     tracing::trace!(
                         "SESSION_EXPIRED(REJECT_AFTER_TIME): {}",
@@ -465,6 +465,16 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         } else {
             None
         }
+    }
+
+    /// Whether the current session exists and is not yet due for rekeying.
+    pub fn has_active_session(&self) -> bool {
+        let current_session = self.current % super::N_SESSIONS;
+        let session_age = self
+            .timers
+            .now()
+            .saturating_sub(self.timers.session_timers[current_session]);
+        self.sessions[current_session].is_some() && session_age < self.timers.rekey_after_time
     }
 
     /// Get the persistent keepalive interval in seconds.

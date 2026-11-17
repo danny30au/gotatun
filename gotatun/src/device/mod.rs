@@ -48,9 +48,9 @@ use crate::task::Task;
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
 use crate::udp::buffer::{BufferedUdpReceive, BufferedUdpSend};
 use crate::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
-use crate::x25519;
 use allowed_ips::AllowedIps;
-use peer_state::PeerState;
+use gotatun_crypto::x25519;
+use peer_state::{PeerState, PendingHandshake};
 
 #[cfg(feature = "tun")]
 pub use crate::device::transports::DefaultDeviceTransports;
@@ -68,6 +68,10 @@ const MAX_PACKET_BUFS: usize = 4000;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Multiple peers have the same public key
+    #[error("Multiple peers have the same public key")]
+    DuplicatePeer,
+
     /// I/O error
     #[error("i/o error: {0}")]
     IoError(#[from] io::Error),
@@ -85,6 +89,18 @@ pub enum Error {
     #[error("Failed to initialize DAITA hooks")]
     #[cfg(feature = "daita")]
     DaitaHooks(#[from] daita::Error),
+
+    /// No peer with the given public key exists
+    #[error("No peer with the given public key exists")]
+    PeerNotFound,
+
+    /// The peer has no known endpoint
+    #[error("The peer has no known endpoint")]
+    NoEndpoint,
+
+    /// The device has no active connection, e.g. because it is suspended
+    #[error("The device has no active connection")]
+    NotConnected,
 }
 
 /// A reference-counted handle to a WireGuard device.
@@ -146,8 +162,6 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
 pub(crate) struct Connection<T: DeviceTransports> {
     udp: <T::UdpTransportFactory as UdpTransportFactory>::Send,
 
-    listen_port: Option<u16>,
-
     /// The task that reads IPv4 traffic from the UDP socket.
     incoming: Task,
 
@@ -180,6 +194,12 @@ impl<T: DeviceTransports> Connection<T> {
         }
 
         let (udp_tx, udp_rx) = device.open_listen_socket().await?;
+
+        // Remember the bound port in case it was 0
+        if let Some(addr) = udp_tx.local_addr()? {
+            device.port = addr.port();
+        }
+
         let (buffered_ip_tx, buffered_ip_rx) = crate::tun::buffer::channel(
             MAX_PACKET_BUFS,
             pool.clone(),
@@ -244,7 +264,6 @@ impl<T: DeviceTransports> Connection<T> {
 
         debug_assert!(device.connection.is_none());
         device.connection = Some(Connection {
-            listen_port: udp_tx.local_addr()?.map(|sa| sa.port()),
             udp: udp_tx,
             incoming,
             timers,
@@ -335,6 +354,45 @@ impl<T: DeviceTransports> Device<T> {
         }
 
         Connection::set_up(self.inner.clone()).await
+    }
+
+    /// Wait until there is a session with the peer with `public_key` that is not yet due for
+    /// rekeying.
+    ///
+    /// Returns immediately if such a session exists. Otherwise, a handshake initiation is sent
+    /// unless one is already in progress, and this waits until a handshake initiated by us
+    /// completes. Note that this function never times out.
+    ///
+    /// Returns [`Error::PeerNotFound`] if the peer does not exist or is removed while waiting.
+    pub async fn force_handshake(&self, public_key: &x25519::PublicKey) -> Result<(), Error> {
+        let mut completed = {
+            let device = self.inner.read().await;
+            let connection = device.connection.as_ref().ok_or(Error::NotConnected)?;
+            let peer_arc = device.peers.get(public_key).ok_or(Error::PeerNotFound)?;
+
+            let mut peer = peer_arc.lock().await;
+            let Some(PendingHandshake {
+                completed,
+                initiation,
+            }) = peer.force_handshake()?
+            else {
+                return Ok(());
+            };
+
+            if let Some((packet, endpoint_addr)) = initiation {
+                let packet = WgKind::from(packet);
+                DeviceState::<T>::register_handshake_idx(&device.peers_by_idx, &packet, peer_arc);
+                drop(peer);
+
+                // NOTE: Like `handle_timers`, this does not trigger DAITA events.
+                connection.udp.send_to(packet.into(), endpoint_addr).await?;
+            }
+
+            completed
+        };
+
+        // The sender is dropped along with the peer
+        completed.changed().await.map_err(|_| Error::PeerNotFound)
     }
 
     /// Wait until an unrecoverable error occurs.
@@ -565,6 +623,13 @@ impl<T: DeviceTransports> DeviceState<T> {
                 .lock()
                 .retain(|idx, _| device.index_table.in_use(*idx));
 
+            // NOTE: Try to reset the packet counts here in addition to inside of `PeerState::update_timers`.
+            // Otherwise if the device has no peers, try_reset_count will never trigger, and packet
+            // counts will accumulate indefinitely. Fixes GHSA-m2rr-7rr7-vmp7.
+            if let Some(rate_limiter) = device.rate_limiter.as_ref() {
+                rate_limiter.try_reset_count();
+            }
+
             // TODO: pass in peers instead?
             let peer_map = &device.peers;
 
@@ -619,15 +684,19 @@ impl<T: DeviceTransports> DeviceState<T> {
             (private_key, public_key, rate_limiter, tun_mtu)
         };
 
-        while let Ok((src_buf, addr)) = udp_rx.recv_from(&mut packet_pool).await {
+        loop {
+            let (src_buf, addr) = udp_rx
+                .recv_from(&mut packet_pool)
+                .await
+                .map_err(Error::IoError)?;
             let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
                 Ok(packet) => packet,
                 Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
                     // Note: Cookies should not affect counters.
-                    if let Err(_err) = udp_tx.send_to(cookie.into(), addr).await {
-                        tracing::trace!("udp.send_to failed");
-                        break;
-                    }
+                    udp_tx
+                        .send_to(cookie.into(), addr)
+                        .await
+                        .map_err(Error::IoError)?;
                     continue;
                 }
                 Err(_) => continue,
@@ -663,16 +732,15 @@ impl<T: DeviceTransports> DeviceState<T> {
             let Some(peer_arc) = peer else { continue };
             let mut peer = peer_arc.lock().await;
 
+            let result = peer.handle_incoming_packet(parsed_packet, addr);
+
             #[cfg(feature = "daita")]
             let PeerState { tunnel, daita, .. } = &mut *peer;
             #[cfg(not(feature = "daita"))]
             let PeerState { tunnel, .. } = &mut *peer;
 
-            match tunnel.handle_incoming_packet(parsed_packet) {
-                TunnResult::Done => {
-                    // Don't update the peer endpoint on cookie replies, for consistency
-                    // with both the Linux kernel and wireguard-go.
-                }
+            match result {
+                TunnResult::Done => {}
                 TunnResult::Err(_) => continue,
                 // Flush pending queue
                 TunnResult::WriteToNetwork(packet) => {
@@ -695,9 +763,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                             break;
                         }
                     }
-
-                    // Update the peer endpoint if we received any authenticated packet
-                    peer.set_endpoint(addr);
                 }
                 #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
                 TunnResult::WriteToTunnel(mut packet) => {
@@ -708,9 +773,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                             None => continue,
                         }
                     }
-
-                    // Update the peer endpoint if we received any authenticated packet
-                    peer.set_endpoint(addr);
 
                     // keepalive
                     if packet.is_empty() {
@@ -749,8 +811,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Read from tunnel device, encapsulate, and write to UDP socket for the corresponding peer
@@ -856,7 +916,6 @@ impl<T: DeviceTransports> Connection<T> {
     async fn stop(self) {
         let Self {
             udp,
-            listen_port: _,
             incoming,
             timers,
             outgoing,
